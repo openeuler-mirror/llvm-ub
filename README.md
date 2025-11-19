@@ -10,7 +10,7 @@ concurrency. This approach significantly improves programming efficiency and
 cross-platform portability.
 
 2. Required before building: Install Ray using the recommended command:
-  pip install -U ray[cpp]== 2.34.0
+  pip install -U ray[cpp]== 2.48.0
 
 3. Building method:
   Add the -M option when building the LLVM command.

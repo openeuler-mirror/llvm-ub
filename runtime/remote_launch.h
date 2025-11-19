@@ -56,7 +56,7 @@ template <auto F, typename... Args> auto remoteLaunchAsync(Args... args) {
 }
 
 template <typename F, typename... Args>
-auto remoteLaunchAsync(F func, id_type& id, Args &&...args) {
+auto remoteLaunchAsync(F func, id_type &id, Args &&...args) {
   using ClassType = class_of_mfunction_t<F>;
 
   ray::ActorHandle<ClassType> actor(id);

@@ -24,5 +24,6 @@
 #include "wait_all.h"
 #include "wait_any.h"
 #include "wait_some.h"
+#include "locality.h"
 
 #endif // MATRIXCPP_H
