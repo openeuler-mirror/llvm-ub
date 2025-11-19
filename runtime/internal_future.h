@@ -1,4 +1,4 @@
-//===--- InternalFuture.h - Low-level future abstraction. -*- C++ -*------===//
+//===--- internal_future.h - Low-level future abstraction. -*- C++ -*------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,7 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 /**
- * @file InternalFuture.h
+ * @file internal_future.h
  * @brief Core abstraction layer for future implementation
  *
  * Implements fundamental operations with:

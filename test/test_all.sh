@@ -102,5 +102,56 @@ else
   echo "test_wait failed"
 fi
 
+# test locality
+echo ">>> Running test_locality..."
+set +e
+OUTPUT5=$(./build/test_locality/test_locality 2>&1)
+STATUS5=$?
+set -e
+echo "$OUTPUT5" >> "$LOG_FILE"
+
+if [ $STATUS5 -eq 0 ] && echo "$OUTPUT5" | grep -q "All Tests Completed Successfully"; then
+  echo "test_locality passed"
+else
+  echo "---- test_locality output ----"
+  echo "$OUTPUT5"
+  echo "--------------------------------"
+  echo "test_locality failed"
+fi
+
+# test segmented_vector
+echo ">>> Running test_segmented_vector..."
+set +e
+OUTPUT6=$(./build/test_segmented_vector/test_segmented_vector 2>&1)
+STATUS6=$?
+set -e
+echo "$OUTPUT6" >> "$LOG_FILE"
+
+if [ $STATUS6 -eq 0 ] && echo "$OUTPUT6" | grep -q "9 9"; then
+  echo "test_segmented_vector passed"
+else
+  echo "---- test_segmented_vector output ----"
+  echo "$OUTPUT6"
+  echo "--------------------------------"
+  echo "test_segmented_vector failed"
+fi
+
+# test segmented_unordered_map...
+echo ">>> Running test_segmented_unordered_map..."
+set +e
+OUTPUT7=$(./build/test_segmented_unordered_map/test_segmented_unordered_map 2>&1)
+STATUS7=$?
+set -e
+echo "$OUTPUT7" >> "$LOG_FILE"
+
+if [ $STATUS7 -eq 0 ] && echo "$OUTPUT7" | grep -q "3 3"; then
+  echo "test_segmented_unordered_map passed"
+else
+  echo "---- test_segmented_unordered_map output ----"
+  echo "$OUTPUT7"
+  echo "--------------------------------"
+  echo "test_segmented_unordered_map failed"
+fi
+
 echo ">>> All Test Done, Stopping Ray..."
 ray stop --force >> "$LOG_FILE" 2>&1

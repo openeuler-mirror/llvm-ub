@@ -32,6 +32,8 @@ set_target_properties(ray_api PROPERTIES
     IMPORTED_NO_SONAME TRUE
 )
 
+set(BISHENG_SCRIPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/runtime/scripts")
+
 # Main MatrixCPP library configuration
 file(GLOB MatrixCPP_SRC "runtime/*.cpp")
 
@@ -41,6 +43,9 @@ target_include_directories(MatrixCPP PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RAY_INCLUDE_PATH}
+)
+target_compile_definitions(MatrixCPP PRIVATE
+    BISHENG_DEFAULT_SCRIPTS_DIR="${BISHENG_SCRIPTS_DIR}"
 )
 target_link_libraries(MatrixCPP PUBLIC
     ray_api
