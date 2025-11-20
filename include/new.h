@@ -26,14 +26,18 @@
 
 namespace bisheng {
 
-template <typename Component, typename F, typename... Args>
+template <typename Component, typename F, typename... Args,
+  typename Enable = std::enable_if_t<
+  std::is_same_v<Component *, std::invoke_result_t<F, Args...>>>>
 id_type createNew(F func, Args &&...args) {
   return createComponent<Component>(func, args...);
 }
 
-template <typename Component, typename F, typename... Args>
-id_type createNew(std::string node, double value, F func, Args &&...args) {
-  return createComponent<Component>(node, value, func, args...);
+template <typename Component, typename F, typename... Args,
+  typename Enable = std::enable_if_t<
+  std::is_same_v<Component *, std::invoke_result_t<F, Args...>>>>
+id_type createNew(F func, std::string node, double value, Args &&...args) {
+  return createComponent<Component>(func, node, value, args...);
 }
 } // namespace bisheng
 

@@ -155,6 +155,22 @@ private:
 
 using id_type = std::string;
 
+inline std::string serialize_actor_internal(const id_type& id) {
+  return ray::internal::RayRuntimeHolder::Instance()
+    .Runtime()->SerializeActorHandle(id);
+}
+
+inline id_type deserialize_actor_internal(const std::string& str) {
+  return ray::internal::RayRuntimeHolder::Instance()
+    .Runtime()->DeserializeAndRegisterActorHandle(str);
+}
+
+template<typename Function>
+static bool register_function_internal(
+  std::string const &name, const Function &f) {
+  return ray::internal::FunctionManager::Instance()
+    .RegisterRemoteFunction(name, f);
+}
 } // namespace bisheng
 
 #endif // BISHENG_INTERNAL_FUTURE_H

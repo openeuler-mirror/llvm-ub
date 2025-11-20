@@ -82,6 +82,19 @@ public:
 private:
   InternalFuture<T> impl_;
 };
+
+inline std::string actor_serialize(const id_type& id) {
+  return serialize_actor_internal(id);
+}
+
+inline id_type actor_deserialize(const std::string& str) {
+  return deserialize_actor_internal(str);
+}
+
+template<typename Function>
+static bool register_function(std::string const &name, const Function &f) {
+  return register_function_internal(name, f);
+}
 } // namespace bisheng
 
 #endif // BISHENG_FUTURE_H

@@ -53,7 +53,7 @@ namespace bisheng {
     }
   }
 
-  inline constexpr void wait_all() { return; }
+  inline void wait_all() { return; }
 
   template <typename T, typename... Ts>
   void wait_all(future<T> &f, Ts &&...ts) {

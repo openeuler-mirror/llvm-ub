@@ -74,7 +74,7 @@ namespace bisheng {
     } while (count < n);
   }
 
-  void wait_some(std::size_t n) { return; }
+  inline void wait_some(std::size_t n) { return; }
 
   template <typename T, typename... Ts>
   void wait_some(std::size_t n, future<T> &f, Ts &&...ts) {
