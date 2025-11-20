@@ -1,0 +1,644 @@
+Subject: [PATCH] support-remote-sort
+
+---
+ CMakeLists.txt                                |   7 +
+ .../compiler_options.cmake                    |   2 +-
+ sql/CMakeLists.txt                            |  42 ++-
+ sql/filesort.cc                               | 307 +++++++++++++++++-
+ sql/filesort_utils.h                          |   4 +
+ sql/mysqld.cc                                 |   4 +
+ sql/sort_param.h                              |   4 +
+ sql/sys_vars.cc                               |   5 +
+ sql/system_variables.h                        |   1 +
+ 9 files changed, 361 insertions(+), 15 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fd377c40451..f8ea29c7ff7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -515,6 +515,12 @@ GET_FILENAME_COMPONENT(REALPATH_CMAKE_BINARY_DIR ${CMAKE_BINARY_DIR} REALPATH)
+ MESSAGE(STATUS "Source directory ${REALPATH_CMAKE_SOURCE_DIR}")
+ MESSAGE(STATUS "Binary directory ${REALPATH_CMAKE_BINARY_DIR}")
+ 
++IF(NOT DEFINED MATRIXCPP_SOURCE_PATH)
++    MESSAGE(FATAL_ERROR "MATRIXCPP_SOURCE_PATH not set. Please input by -DMATRIXCPP_SOURCE_PATH=/path/to/MatrixCPP")
++ENDIF()
++SET(MatrixCPP_DIR "${MATRIXCPP_SOURCE_PATH}/build")
++FIND_PACKAGE(MatrixCPP 1.0 REQUIRED)
++
+ # IN PB2 we have a few configurations which are built in-source (e.g. doxygen).
+ IF(DEFINED ENV{PB2WORKDIR})
+   OPTION(FORCE_INSOURCE_BUILD "Allow in-source build" ON)
+@@ -2254,6 +2260,7 @@ INCLUDE(CPack)
+ # Note that CMakeCache.txt contains cmake builtins for these variables,
+ # *not* the values that will actually be used, which we report here:
+ 
++
+ IF(BUILD_IS_SINGLE_CONFIG)
+   MESSAGE(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
+ ENDIF()
+diff --git a/cmake/build_configurations/compiler_options.cmake b/cmake/build_configurations/compiler_options.cmake
+index a30eafe16d9..67380906505 100644
+--- a/cmake/build_configurations/compiler_options.cmake
++++ b/cmake/build_configurations/compiler_options.cmake
+@@ -30,7 +30,7 @@ SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ IF(UNIX)  
+
+   IF(MY_COMPILER_IS_GNU_OR_CLANG AND NOT SOLARIS)
+-    SET(SECTIONS_FLAG "-ffunction-sections -fdata-sections")
++    SET(SECTIONS_FLAG "-ffunction-sections -fdata-sections -D_GLIBCXX_USE_CXX11_ABI=0")
+   ELSE()
+     SET(SECTIONS_FLAG)
+   ENDIF()
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index 1ea1bad21b7..1759eaddcdf 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -873,7 +873,6 @@ IF(HAVE_NO_BUILTIN_MEMCMP)
+   )
+ ENDIF()
+
+-
+ ADD_LIBRARY(sql_main STATIC ${SQL_SOURCE})
+ ADD_DEPENDENCIES(sql_main GenServerSource)
+ ADD_DEPENDENCIES(sql_main GenDigestServerSource)
+@@ -881,13 +880,41 @@ ADD_DEPENDENCIES(sql_main GenBootstrapPriv)
+ ADD_DEPENDENCIES(sql_main GenSysSchema)
+ TARGET_LINK_LIBRARIES(sql_main ${MYSQLD_STATIC_PLUGIN_LIBS}
+   mysql_server_component_services mysys strings vio
+-  binlogevents_static ${LIBWRAP} ${LIBDL} ${SSL_LIBRARIES})
++  binlogevents_static ${LIBWRAP} ${LIBDL} ${SSL_LIBRARIES}
++  ${MatrixCPP_LIBRARIES})
+ 
+ # sql/immutable_string.h uses
+ # google::protobuf::io::CodedOutputStream::WriteVarint64ToArray
+ # which may or may not be inlined.
+ TARGET_LINK_LIBRARIES(sql_main ${PROTOBUF_LITE_LIBRARY})
+
++ADD_LIBRARY(matrix_cpp_function SHARED ${SQL_SOURCE})
++ADD_DEPENDENCIES(matrix_cpp_function GenServerSource)
++ADD_DEPENDENCIES(matrix_cpp_function GenDigestServerSource)
++ADD_DEPENDENCIES(matrix_cpp_function GenBootstrapPriv)
++ADD_DEPENDENCIES(matrix_cpp_function GenSysSchema)
++TARGET_LINK_LIBRARIES(matrix_cpp_function ${MYSQLD_STATIC_PLUGIN_LIBS}
++  mysql_server_component_services mysys strings vio
++  binlogevents_static ${LIBWRAP} ${LIBDL} ${SSL_LIBRARIES}
++  ${MatrixCPP_LIBRARIES})
++
++
++# sql/immutable_string.h uses
++# google::protobuf::io::CodedOutputStream::WriteVarint64ToArray
++# which may or may not be inlined.
++TARGET_LINK_LIBRARIES(matrix_cpp_function ${PROTOBUF_LITE_LIBRARY})
++
++SET_TARGET_PROPERTIES(matrix_cpp_function PROPERTIES
++  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/runtime_output_directory
++)
++
++ADD_INSTALL_RPATH(matrix_cpp_function "\$ORIGIN/../${INSTALL_PRIV_LIBDIR}")
++ADD_INSTALL_RPATH(matrix_cpp_function "${MatrixCPP_DIR}")
++
++INSTALL(TARGETS matrix_cpp_function
++  LIBRARY DESTINATION ${INSTALL_SBINDIR}
++)
++
+ ADD_LIBRARY(sql_gis STATIC ${SQL_GIS_SOURCES})
+ ADD_DEPENDENCIES(sql_gis GenServerSource)
+ ADD_DEPENDENCIES(sql_gis GenDigestServerSource)
+@@ -1035,6 +1062,11 @@ IF(WITH_ICU STREQUAL "bundled")
+   TARGET_LINK_LIBRARIES(sql_main ${ICU_LIBRARIES})
+ ENDIF()
+
++TARGET_LINK_LIBRARIES(matrix_cpp_function rpl master slave binlog)
++IF(WITH_ICU STREQUAL "bundled")
++  TARGET_LINK_LIBRARIES(matrix_cpp_function ${ICU_LIBRARIES})
++ENDIF()
++
+ IF(WIN32)
+   SET(MYSQLD_SOURCE main.cc nt_servc.cc nt_servc.h message.rc)
+ ELSE()
+@@ -1158,6 +1190,12 @@ TARGET_LINK_LIBRARIES(mysqld
+   sql_main sql_gis binlog rpl master slave sql_dd mysys
+   minchassis binlogevents_static ${ICU_LIBRARIES})
+ 
++ADD_INSTALL_RPATH(mysqld "${MatrixCPP_DIR}")
++
++TARGET_LINK_LIBRARIES(matrix_cpp_function
++  sql_main sql_gis binlog rpl master slave sql_dd mysys
++  minchassis binlogevents_static ${ICU_LIBRARIES})
++
+ # Add dependency on ldap library, to ensure it is not unloaded
+ # when we shutdown the authentication plugin.
+ # For Valgrind, we need it to enable our suppressions.
+diff --git a/sql/filesort.cc b/sql/filesort.cc
+index 6699d08d235..c6d546292c5 100644
+--- a/sql/filesort.cc
++++ b/sql/filesort.cc
+@@ -48,6 +48,7 @@
+ #include <new>
+ #include <optional>
+ #include <vector>
++#include <tuple>
+ 
+ #include "add_with_saturate.h"
+ #include "decimal.h"
+@@ -112,6 +113,8 @@
+ #include "sql_string.h"
+ #include "template_utils.h"
+
++#include <MatrixCPP.h>
++
+ using std::max;
+ using std::min;
+
+@@ -144,10 +147,15 @@ static ha_rows read_all_rows(
+     table_map tables_to_get_rowid_for, Filesort_info *fs_info,
+     IO_CACHE *chunk_file, IO_CACHE *tempfile,
+     Bounded_queue<uchar *, uchar *, Sort_param, Mem_compare_queue_key> *pq,
+-    RowIterator *source_iterator, ha_rows *found_rows, size_t *longest_key,
+-    size_t *longest_addon);
++    bool use_remote_sort, RowIterator *source_iterator, ha_rows *found_rows,
++    size_t *longest_key, size_t *longest_addon,
++    std::vector<bisheng::id_type> &actors);
+ static int write_keys(Sort_param *param, Filesort_info *fs_info, uint count,
+                       IO_CACHE *buffer_file, IO_CACHE *tempfile);
++static int write_keys_only(Sort_param *param, Filesort_info *fs_info,
++  uint count, IO_CACHE *buffer_file, IO_CACHE *tempfile,
++  std::vector<std::tuple<uint, int, int, bool, bool, bool>> &sf_arrays,
++  std::vector<bisheng::id_type> &actors);
+ static int merge_index(THD *thd, Sort_param *param, Sort_buffer sort_buffer,
+                        Merge_chunk_array chunk_array, IO_CACHE *tempfile,
+                        IO_CACHE *outfile);
+@@ -158,6 +166,155 @@ static bool check_if_pq_applicable(Opt_trace_context *trace, Sort_param *param,
+                                    Filesort_info *info, ha_rows records,
+                                    ulong memory_available);
+ 
++
++class RemoteSortActor {
++public:
++  Filesort_buffer m_filesort;
++  Sort_param m_param;
++  std::vector<st_sort_field> m_sortorder;
++  std::vector<size_t> m_pointers;
++  size_t m_num_input_rows;
++  size_t m_max_output_rows;
++
++  std::string m_file_name;
++  File m_file;
++  my_off_t m_file_position;
++  size_t m_bytes_to_read;
++
++  RemoteSortActor() {
++    m_param.addon_fields = nullptr;
++    m_file = -1;
++  }
++  ~RemoteSortActor() {
++    m_filesort.free_sort_buffer();
++    if (m_param.addon_fields != nullptr) {
++      delete m_param.addon_fields;
++    }
++    if (m_file != -1) {
++      (void)close(m_file);
++    }
++  }
++
++  static RemoteSortActor* getRemoteActor(
++    size_t memory_available,
++    std::vector<size_t> pointers,
++    uint fixed_rec_length,
++    uint fixed_sort_length,
++    uint fixed_res_length,
++    bool remove_duplicates,
++    std::vector<std::tuple<uint, int, int, bool, bool, bool>> local_sortorder,
++    bool use_hash,
++    bool using_addon_fields,
++    bool using_packed_addons,
++    uint sum_ref_length,
++    size_t num_input_rows,
++    size_t max_output_rows,
++    std::string file_name,
++    my_off_t file_position,
++    size_t bytes_to_read
++    ) {
++
++    RemoteSortActor* actor = new RemoteSortActor();
++
++    Sort_param& param = actor->m_param;
++    param.m_remove_duplicates = remove_duplicates;
++
++    actor->m_sortorder.reserve(local_sortorder.size());
++    for (auto sortorder : local_sortorder) {
++      auto [
++        length,
++        result_type,
++        field_type,
++        reverse,
++        is_varlen,
++        maybe_null] = sortorder;
++      actor->m_sortorder.push_back({nullptr,
++        length,
++        (Item_result)result_type,
++        (enum_field_types)field_type,
++        reverse,
++        is_varlen,
++        maybe_null
++      });
++    }
++    param.init_for_unittest(
++      make_array(actor->m_sortorder.data(), actor->m_sortorder.size()));
++    param.use_hash = use_hash;
++    if (using_addon_fields) {
++      Addon_fields_array empty_array((Sort_addon_field*)-1, 0);
++      Addon_fields* addon_fields = new Addon_fields(empty_array);
++      addon_fields->set_using_packed_addons(using_packed_addons);
++      param.addon_fields = addon_fields;
++      param.set_using_packed_addons(using_packed_addons);
++    }
++    param.sum_ref_length = sum_ref_length;
++    param.fixed_res_length = fixed_res_length;
++    param.set_max_record_length(fixed_rec_length);
++    param.set_max_compare_length(fixed_sort_length);
++
++    Filesort_buffer& filesort = actor->m_filesort;
++    filesort.set_max_size(memory_available, param.max_record_length());
++
++    actor->m_pointers = std::move(pointers);
++
++    actor->m_num_input_rows = num_input_rows;
++    actor->m_max_output_rows = max_output_rows;
++
++    actor->m_file_name = file_name;
++    actor->m_file_position = file_position;
++    actor->m_bytes_to_read = bytes_to_read;
++
++    return actor;
++  }
++
++  uint Sort() {
++
++    m_file = open(m_file_name.c_str(), O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
++    if (m_file == -1) {
++      assert(0);
++    }
++
++    Bounds_checked_array<uchar> buffer = m_filesort.get_contiguous_buffer();
++    if (mysql_file_pread(m_file, buffer.array(),
++      m_bytes_to_read, m_file_position, MYF_RW)) {
++      return (uint)-1;
++    }
++
++    for (auto num_bytes : m_pointers) {
++      m_filesort.commit_used_memory(num_bytes);
++    }
++
++    uchar* block = (uchar *)my_malloc(
++      key_memory_Filesort_buffer_sort_keys, m_bytes_to_read, MYF(0));
++    size_t count = m_filesort.sort_buffer(&m_param, m_num_input_rows, m_max_output_rows);
++    uchar* ptr = block;
++    for (uint ix = 0; ix < count; ++ix) {
++      uchar *record = m_filesort.get_sorted_record(ix);
++      size_t rec_length = m_param.get_record_length(record);
++
++      memcpy(ptr, record, rec_length);
++      ptr += rec_length;
++    }
++
++    if (mysql_file_pwrite(m_file, block,
++      m_bytes_to_read, m_file_position, MYF(MY_WME) | MY_NABP)) {
++      return (uint)-1;
++    }
++
++    close(m_file);
++    m_file = -1;
++    m_filesort.free_sort_buffer();
++    my_free(block);
++    return 0;
++  }
++
++};
++
++BISHENG_REMOTE(
++  RemoteSortActor::getRemoteActor,
++  &RemoteSortActor::Sort);
++
++
+ void Sort_param::decide_addon_fields(Filesort *file_sort,
+                                      const Mem_root_array<TABLE *> &tables,
+                                      bool force_sort_positions) {
+@@ -378,6 +535,8 @@ bool filesort(THD *thd, Filesort *filesort, RowIterator *source_iterator,
+   uint s_length = 0;
+ 
+   DBUG_TRACE;
++  bool use_remote_sort = thd->variables.use_remote_sort &&
++    !filesort->m_remove_duplicates;
+ 
+ #ifndef NDEBUG
+   // 'pushed_join' feature need to read the partial joined results directly
+@@ -444,6 +603,7 @@ bool filesort(THD *thd, Filesort *filesort, RowIterator *source_iterator,
+       param->max_record_length(),
+       (Malloc_allocator<uchar *>(key_memory_Filesort_info_record_pointers)));
+ 
++  std::vector<bisheng::id_type> actors;
+   // We would have liked to do this ahead-of-time so that we can show it
+   // in EXPLAIN. However, we don't know the table->file->ref_length before
+   // sorting time, which makes it hard to make the decision if we're row IDs.
+@@ -514,7 +674,10 @@ bool filesort(THD *thd, Filesort *filesort, RowIterator *source_iterator,
+     num_rows_found = read_all_rows(
+         thd, param, filesort->tables, tables_to_get_rowid_for, fs_info,
+         &chunk_file, &tempfile, param->using_pq ? &pq : nullptr,
+-        source_iterator, found_rows, &longest_key, &longest_addons);
++        use_remote_sort,
++        source_iterator, found_rows, &longest_key, &longest_addons,
++        actors);
++
+     if (num_rows_found == HA_POS_ERROR) goto err;
+   }
+ 
+@@ -557,6 +720,21 @@ bool filesort(THD *thd, Filesort *filesort, RowIterator *source_iterator,
+       goto err;
+     if (reinit_io_cache(outfile, WRITE_CACHE, 0L, false, false)) goto err;
+ 
++    if (use_remote_sort) {
++      flush_io_cache(&tempfile);
++      std::vector<bisheng::future<uint>> futures;
++      for (auto actor : actors) {
++        futures.push_back(
++          bisheng::async<&RemoteSortActor::Sort>(actor)
++        );
++      }
++      bisheng::wait_all(futures);
++      int res = unlinkat(tempfile.file, my_filename(tempfile.file), 0);
++      if (res < 0) {
++        assert(0);
++      }
++    }
++
+     param->max_rows_per_buffer = static_cast<uint>(
+         fs_info->max_size_in_bytes() / param->max_record_length());
+ 
+@@ -628,6 +806,7 @@ err:
+     my_free(fs_info->merge_chunks.array());
+     fs_info->merge_chunks = Merge_chunk_array(nullptr, 0);
+   }
++
+   close_cached_file(&tempfile);
+   close_cached_file(&chunk_file);
+   if (my_b_inited(outfile)) {
+@@ -935,8 +1114,10 @@ static ha_rows read_all_rows(
+     table_map tables_to_get_rowid_for, Filesort_info *fs_info,
+     IO_CACHE *chunk_file, IO_CACHE *tempfile,
+     Bounded_queue<uchar *, uchar *, Sort_param, Mem_compare_queue_key> *pq,
++    bool use_remote_sort,
+     RowIterator *source_iterator, ha_rows *found_rows, size_t *longest_key,
+-    size_t *longest_addons) {
++    size_t *longest_addons,
++    std::vector<bisheng::id_type> &actors) {
+   /*
+     Set up an error handler for filesort. It is automatically pushed
+     onto the internal error handler stack upon creation, and will be
+@@ -952,6 +1133,7 @@ static ha_rows read_all_rows(
+   size_t longest_key_so_far = 0;
+   size_t longest_addon_so_far = 0;
+ 
++  std::vector<std::tuple<uint, int, int, bool, bool, bool>> sf_arrays;
+   // NOTE(sgunders): When we sort row IDs, our read sets are a bit larger
+   // than required by read_all_rows(); in particular, columns that we
+   // don't sort on will still be read. (In particular, this makes us read
+@@ -977,6 +1159,18 @@ static ha_rows read_all_rows(
+   if (pq == nullptr) {
+     fs_info->reset();
+     fs_info->clear_peak_memory_used();
++    if (use_remote_sort) {
++      for (auto sortorder : param->local_sortorder) {
++        sf_arrays.push_back(
++          std::make_tuple(
++            sortorder.length,
++            sortorder.result_type,
++            sortorder.field_type,
++            sortorder.reverse,
++            sortorder.is_varlen,
++            sortorder.maybe_null));
++       }
++    }
+   }
+ 
+   PFSBatchMode batch_mode(source_iterator);
+@@ -1022,9 +1216,14 @@ static ha_rows read_all_rows(
+         }
+         // Out of room, so flush chunk to disk (if there's anything to flush).
+         if (num_records_this_chunk > 0) {
+-          if (write_keys(param, fs_info, num_records_this_chunk, chunk_file,
+-                         tempfile)) {
+-            return HA_POS_ERROR;
++          if (use_remote_sort) {
++            write_keys_only(param, fs_info, num_records_this_chunk, chunk_file,
++                          tempfile, sf_arrays, actors);
++          } else {
++            if (write_keys(param, fs_info, num_records_this_chunk, chunk_file,
++                          tempfile)) {
++              return HA_POS_ERROR;
++            }
+           }
+           num_records_this_chunk = 0;
+           num_written_chunks++;
+@@ -1062,10 +1261,15 @@ static ha_rows read_all_rows(
+   if (error == 1) {
+     return HA_POS_ERROR;
+   }
+-  if (num_written_chunks != 0 && num_records_this_chunk != 0 &&
+-      write_keys(param, fs_info, num_records_this_chunk, chunk_file,
+-                 tempfile)) {
+-    return HA_POS_ERROR;  // purecov: inspected
++  if (use_remote_sort && num_records_this_chunk > 0) {
++    write_keys_only(param, fs_info, num_records_this_chunk, chunk_file,
++                  tempfile, sf_arrays, actors);
++  } else {
++    if (num_written_chunks != 0 && num_records_this_chunk != 0 &&
++        write_keys(param, fs_info, num_records_this_chunk, chunk_file,
++                  tempfile)) {
++      return HA_POS_ERROR;  // purecov: inspected
++    }
+   }
+ 
+   DBUG_PRINT("info", ("read_all_rows return %lu", (ulong)num_total_records));
+@@ -1094,7 +1298,6 @@ static ha_rows read_all_rows(
+   @returns
+     1 Error
+ */
+-
+ static int write_keys(Sort_param *param, Filesort_info *fs_info, uint count,
+                       IO_CACHE *chunk_file, IO_CACHE *tempfile) {
+   Merge_chunk merge_chunk;
+@@ -1130,7 +1333,87 @@ static int write_keys(Sort_param *param, Filesort_info *fs_info, uint count,
+   if (my_b_write(chunk_file, pointer_cast<uchar *>(&merge_chunk),
+                  sizeof(merge_chunk)))
+     return 1; /* purecov: inspected */
++  return 0;
++} /* write_keys */
++
++static int write_keys_only(Sort_param *param, Filesort_info *fs_info,
++  uint count, IO_CACHE *chunk_file, IO_CACHE *tempfile,
++  std::vector<std::tuple<uint, int, int, bool, bool, bool>> &sf_arrays,
++  std::vector<bisheng::id_type> &actors) {
++  Merge_chunk merge_chunk;
++  DBUG_TRACE;
++
++  count = std::min((size_t)count, (size_t)param->max_rows);
++
++  if (!my_b_inited(chunk_file) &&
++      open_cached_file(chunk_file, mysql_tmpdir, TEMP_PREFIX, DISK_BUFFER_SIZE,
++                       MYF(MY_WME)))
++    return 1;
++
++  if (!my_b_inited(tempfile) &&
++      open_cached_file(tempfile, mysql_tmpdir, TEMP_PREFIX, DISK_BUFFER_SIZE,
++                       MYF(MY_WME)))
++    return 1; /* purecov: inspected */
++
++  // Check that we wont have more chunks than we can possibly keep in memory.
++  if (my_b_tell(chunk_file) + sizeof(Merge_chunk) > (ulonglong)UINT_MAX)
++    return 1; /* purecov: inspected */
+ 
++  if (tempfile->file == -1) {
++    if (real_open_cached_file(tempfile)) {
++      return 1;
++    }
++    char path[100];
++    snprintf(path, 100, "/proc/self/fd/%d", tempfile->file);
++    int ret = linkat(tempfile->file, path, AT_FDCWD, my_filename(tempfile->file), AT_SYMLINK_FOLLOW);
++    if (ret < 0) {
++      assert(0);
++    }
++  }
++
++  merge_chunk.set_file_position(my_b_tell(tempfile));
++  merge_chunk.set_rowcount(static_cast<ha_rows>(count));
++
++  std::vector<size_t> pointers;
++  pointers.reserve(count);
++  size_t bytes_to_read = 0;
++  for (uint ix = 0; ix < count; ++ix) {
++    uchar *record = fs_info->get_sorted_record(ix);
++    size_t rec_length = param->get_record_length(record);
++
++    pointers.emplace_back(rec_length);
++    bytes_to_read += rec_length;
++
++    if (my_b_write(tempfile, record, rec_length))
++      return 1; /* purecov: inspected */
++  }
++
++  if (my_b_write(chunk_file, pointer_cast<uchar *>(&merge_chunk),
++                 sizeof(merge_chunk)))
++    return 1; /* purecov: inspected */
++
++  bisheng::id_type actor =
++    bisheng::createNew<RemoteSortActor>(RemoteSortActor::getRemoteActor,
++      fs_info->max_size_in_bytes(),
++      pointers,
++      param->max_record_length(),
++      param->max_compare_length(),
++      param->fixed_res_length,
++      param->m_remove_duplicates,
++      sf_arrays,
++      param->use_hash,
++      param->using_addon_fields(),
++      param->using_packed_addons(),
++      param->sum_ref_length,
++      count,
++      param->max_rows,
++      my_filename(tempfile->file),
++      merge_chunk.file_position(),
++      bytes_to_read
++    );
++
++
++  actors.push_back(actor);
+   return 0;
+ } /* write_keys */
+ 
+diff --git a/sql/filesort_utils.h b/sql/filesort_utils.h
+index 0fd580137cc..98afa81227b 100644
+--- a/sql/filesort_utils.h
++++ b/sql/filesort_utils.h
+@@ -172,6 +172,10 @@ class Filesort_buffer {
+     m_max_record_length = record_length;
+   }
+ 
++  void set_sort_buffer(uchar *sort_buffer) {
++    m_next_rec_ptr = sort_buffer;
++  }
++
+   /**
+     Frees all memory. Unlike reset(), which keeps one block for future use,
+     this actually releases all blocks. It is intended to release memory
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index 8105d4b737e..5189f68941d 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -960,6 +960,8 @@ MySQL clients support the protocol:
+ #include "sql/server_component/persistent_dynamic_loader_imp.h"
+ #include "sql/srv_session.h"
+ 
++#include <MatrixCPP.h>
++
+ using std::max;
+ using std::min;
+ using std::vector;
+@@ -7765,8 +7767,10 @@ int mysqld_main(int argc, char **argv)
+     mysqld::runtime::signal_parent(pipe_write_fd, 1);
+   }
+ 
++  bisheng::StartupShutdown::Init();
+   mysqld_socket_acceptor->check_and_spawn_admin_connection_handler_thread();
+   mysqld_socket_acceptor->connection_event_loop();
++  bisheng::StartupShutdown::Shutdown();
+ #endif /* _WIN32 */
+   server_operational_state = SERVER_SHUTTING_DOWN;
+   sysd::notify("STOPPING=1\nSTATUS=Server shutdown in progress\n");
+diff --git a/sql/sort_param.h b/sql/sort_param.h
+index 2352836c02c..2e2f595d7ed 100644
+--- a/sql/sort_param.h
++++ b/sql/sort_param.h
+@@ -370,6 +370,10 @@ class Sort_param {
+     return m_using_packed_addons;
+   }
+ 
++  void set_using_packed_addons(bool using_packed_addons) {
++    m_using_packed_addons = using_packed_addons;
++  }
++
+   /// Are we using varlen key fields?
+   bool using_varlen_keys() const { return m_num_varlen_keys > 0; }
+ 
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index 4592e4bbb07..b799c35f757 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -4627,6 +4627,11 @@ static Sys_var_ulong Sys_sort_buffer(
+     VALID_RANGE(MIN_SORT_MEMORY, ULONG_MAX), DEFAULT(DEFAULT_SORT_MEMORY),
+     BLOCK_SIZE(1));
+ 
++static Sys_var_bool Sys_use_remote_sort(
++    "use_remote_sort",
++    "Use Remote-sort in filesort",
++    SESSION_VAR(use_remote_sort), CMD_LINE(OPT_ARG), DEFAULT(false));
++
+ /**
+   Check sql modes strict_mode, 'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' and
+   'ERROR_FOR_DIVISION_BY_ZERO' are used together. If only subset of it
+diff --git a/sql/system_variables.h b/sql/system_variables.h
+index 5476a7a3c2e..5d09c5112c0 100644
+--- a/sql/system_variables.h
++++ b/sql/system_variables.h
+@@ -237,6 +237,7 @@ struct System_variables {
+   ulong read_rnd_buff_size;
+   ulong div_precincrement;
+   ulong sortbuff_size;
++  bool use_remote_sort;
+   ulong max_sp_recursion_depth;
+   ulong default_week_format;
+   ulong max_seeks_for_key;
+-- 
+2.23.0
+
