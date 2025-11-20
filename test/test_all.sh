@@ -8,7 +8,7 @@ echo ">>> Stopping any running Ray cluster..."
 ray stop --force > "$LOG_FILE" 2>&1 || true
 
 echo ">>> Starting Ray head node..."
-ray start --head --resources='{"node0": 1}' >> "$LOG_FILE" 2>&1
+ray start --head --resources='{"node0": 128}' >> "$LOG_FILE" 2>&1
 
 #（qeual --address='IP:PORT'）
 RAY_ADDR=$(grep -oP "(?<=--address=')\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+" "$LOG_FILE" | tail -n 1 || true)

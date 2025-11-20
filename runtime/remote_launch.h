@@ -29,6 +29,7 @@
 #include <string>
 
 #define BISHENG_REMOTE_LAUNCH RAY_REMOTE
+#define BISHENG_PACK MSGPACK_DEFINE
 
 namespace bisheng {
 

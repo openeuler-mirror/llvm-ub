@@ -26,7 +26,9 @@
 
 namespace bisheng {
 
-template <typename Component, typename F, typename... Args>
+template <typename Component, typename F, typename... Args,
+  typename Enable = std::enable_if_t<
+  std::is_same_v<Component *, std::invoke_result_t<F, Args...>>>>
 id_type createComponent(F func, Args &&...args) {
   static_assert(std::is_same_v<Component *, std::invoke_result_t<F, Args...>>,
                 "Component type should be same with Function return type!");
@@ -36,8 +38,10 @@ id_type createComponent(F func, Args &&...args) {
   return actor.ID();
 }
 
-template <typename Component, typename F, typename... Args>
-id_type createComponent(std::string node, double value, F func,
+template <typename Component, typename F, typename... Args,
+  typename Enable = std::enable_if_t<
+  std::is_same_v<Component *, std::invoke_result_t<F, Args...>>>>
+id_type createComponent(F func, std::string node, double value,
                         Args &&...args) {
   static_assert(std::is_same_v<Component *, std::invoke_result_t<F, Args...>>,
                 "Component type should be same with Function return type!");

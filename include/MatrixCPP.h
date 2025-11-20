@@ -25,5 +25,7 @@
 #include "wait_any.h"
 #include "wait_some.h"
 #include "locality.h"
+#include "segmented_vector.h"
+#include "segmented_unordered_map.h"
 
 #endif // MATRIXCPP_H

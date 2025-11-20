@@ -27,6 +27,7 @@
 #include "type_traits.h"
 
 #define BISHENG_REMOTE BISHENG_REMOTE_LAUNCH
+#define BISHENG_PACK_DEFINE BISHENG_PACK
 namespace bisheng {
 
 // assign a task to a specific node using its name and value
