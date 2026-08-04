@@ -1,0 +1,14 @@
+# Use ${pcfiledir} (the directory of this .pc file) to make paths
+# relocatable. This allows the tarball to be extracted to any directory
+# without needing to rebuild the .pc file.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: uballoc
+Description: Distributed shared memory allocator for aarch64 Linux
+Version: @PROJECT_VERSION@
+URL: https://gitcode.com/openeuler/llvm-ub
+Libs: -L${libdir} -luballoc -lrt -lpthread@UBALLOC_PC_LIBS@
+Cflags: -I${includedir}@UBALLOC_PC_CFLAGS@
