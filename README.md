@@ -1,27 +1,36 @@
-# MatrixCPP
+# llvm-ub
 
-1. Matrix C++ offers native support for distributed concurrent programming:
-  The native supernode programming model builds upon ISO C++'s inherent
-concurrency capabilities, enhancing supernode-level concurrency and
-heterogeneous computing. It delivers a seamless development experience where
-code written for a single machine can run directly on supernodes, eliminating
-the need for third-party libraries or frameworks to achieve distributed
-concurrency. This approach significantly improves programming efficiency and
-cross-platform portability.
+**中文** | **[English](README.en.md)**
 
-2. Required before building: Install Ray using the recommended command:
-  pip install -U ray[cpp]== 2.48.0
+llvm-ub 是 openEuler 社区下基于 UB（Unified Bus）的分布式编程项目集合，为多进程、多节点共享内存场景提供基础设施。
 
-3. Building method:
-  Add the -M option when building the LLVM command.
+## 子项目
 
-4. To build the MatrixCPP library from source:
-  mkdir build && cd build
-  cmake -DRAY_CPP_PATH=path/to/ray ..
-  make -j
+| 项目 | 说明 | 状态 |
+|------|------|------|
+| [uballoc](uballoc/) | 面向 ARMv8 多进程多节点部署的 C++17 共享内存分配器 | 活跃 |
 
-5. For projects that depend on MatrixCPP, refer to the test directory for
-compilation examples:
-  cd test
-  cmake -DMATRIXCPP_SOURCE_PATH=/path/to/MatrixCPP ..
-  make -j$(nproc)
+## 快速上手
+
+以 uballoc 为例：
+
+```bash
+# POSIX 构建（标准 Linux，无 UBSE 依赖）
+cd uballoc
+cmake -B build -DUBALLOC_USE_UBSE=OFF && cmake --build build -j
+
+# 运行测试
+cd build && ctest --output-on-failure
+```
+
+详细文档见各子项目目录。
+
+## 遗留项目
+
+以下项目不再维护，保留仅供参考：
+
+- [matrixcpp](legacy/matrixcpp/) — 基于 Ray 的分布式并发编程库
+
+## 许可证
+
+Apache-2.0。完整文本见 [LICENSE](LICENSE)。

@@ -1,0 +1,39 @@
+# Build directories
+build/
+build_*/
+build_release/
+build_stash/
+cmake-build-*/
+CMakeFiles/
+Testing/
+
+# CPack output
+*_*.tar.gz
+*_*.tar.xz
+*_*.tar.bz2
+*_*.zip
+
+# Compiled files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+cxlalloc_tests
+cxlalloc_example
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
