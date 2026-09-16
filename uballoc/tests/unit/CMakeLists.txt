@@ -3,7 +3,8 @@ set(UBALLOC_UNIT_TEST_TARGETS
     test_growth
     test_affinity
     test_huge_cross_free
-    test_multi_proc_per_node)
+    test_multi_proc_per_node
+    test_reclaim)
 
 foreach(_target ${UBALLOC_UNIT_TEST_TARGETS})
     add_executable(${_target} ${_target}.cpp)

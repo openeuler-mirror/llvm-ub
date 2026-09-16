@@ -23,6 +23,8 @@
 #include "published.hpp"
 #include "fault_handler.hpp"
 #include "uffd_handler.hpp"
+#include "reclaim_mode.hpp"
+#include "reclaim_thread.hpp"
 
 namespace uballoc {
 
@@ -65,6 +67,9 @@ private:
 
     std::array<PublishedRegistry*, MAX_PROCESSES> published_registry_ptrs_;
     TypeIdMap* type_id_map_;
+
+    std::unique_ptr<ReclaimThread> reclaim_thread_;
+    pid_t reclaim_creator_pid_ = 0;
 
     static std::atomic<uint16_t> g_next_thread_id_;
 
@@ -354,6 +359,8 @@ public:
                                  std::memory_order_release);
         reclaim_fn_large().store(&GlobalAllocator<BackendT>::reclaim_large_static,
                                  std::memory_order_release);
+        reclaim_trigger_fn().store(&GlobalAllocator<BackendT>::reclaim_trigger_static,
+                                   std::memory_order_release);
         backend_.init_reclaim_params();
 
         {
@@ -438,6 +445,27 @@ public:
 
         initialized_ = true;
         ensure_thread_init();
+
+        ReclaimMode mode = parse_reclaim_mode_from_env();
+        set_reclaim_mode(mode);
+        bool is_fork_child = (reclaim_creator_pid_ != 0 &&
+                              ::getpid() != reclaim_creator_pid_);
+        reclaim_creator_pid_ = ::getpid();
+        // Start ReclaimThread only if: ASYNC mode, reclaim enabled,
+        // and not a fork child (short-lived, doesn't need background reclaim).
+        if (mode == ReclaimMode::ASYNC && backend_.return_enabled() && !is_fork_child) {
+            reclaim_thread_ = std::make_unique<ReclaimThread>();
+            reclaim_thread_->set_scan_fn(&GlobalAllocator<BackendT>::scan_all_segments_static);
+            reclaim_thread_->set_deadline_fn(&GlobalAllocator<BackendT>::compute_reclaim_deadline_static);
+            // Read scan interval from env (default 5s)
+            uint64_t scan_ms = 5000;
+            const char* si = std::getenv("UBALLOC_RECLAIM_SCAN_INTERVAL_MS");
+            if (si) {
+                int ms = std::atoi(si);
+                if (ms > 0) scan_ms = static_cast<uint64_t>(ms);
+            }
+            reclaim_thread_->start(scan_ms);
+        }
     }
 
     void wire_up_process(int k) {
@@ -537,6 +565,17 @@ public:
     void reset() {
         if (!initialized_) return;
 
+        if (reclaim_thread_) {
+            bool fork_child = reclaim_thread_->stop();
+            // fork_child: inherited condvar has stale __wrefs from parent's
+            // waiters; destroying it would block in pthread_cond_destroy.
+            // Leak the object — fork children exit via _exit() (skips dtors).
+            if (fork_child)
+		reclaim_thread_.release();
+            else
+		reclaim_thread_.reset();
+        }
+
         if constexpr (BackendT::ShmProvider::has_reliable_unreferenced_check) {
             // UBSE: full cleanup (same as destructor, since fork children
             // call _exit which skips destructors). Must run BEFORE
@@ -600,6 +639,17 @@ public:
     // Used by fork children that inherited the parent's GlobalAllocator state.
     // The parent's shms must NOT be touched — the child will re-init via init().
     void soft_reset() {
+        if (reclaim_thread_) {
+            bool fork_child = reclaim_thread_->stop();
+            // fork_child: inherited condvar has stale __wrefs from parent's
+            // waiters; destroying it would block in pthread_cond_destroy.
+            // Leak the object — fork children exit via _exit() (skips dtors).
+            if (fork_child)
+		reclaim_thread_.release();
+            else
+		reclaim_thread_.reset();
+        }
+
         // Disable the uffd handler and SIGSEGV handler.
         //
         // is_fork_child=false so uffd_uninstall JOINS the handler thread
@@ -625,6 +675,14 @@ public:
         check_remote_fn().store(nullptr, std::memory_order_release);
         reclaim_fn_small().store(nullptr, std::memory_order_release);
         reclaim_fn_large().store(nullptr, std::memory_order_release);
+        reclaim_trigger_fn().store(nullptr, std::memory_order_release);
+        set_reclaim_mode(ReclaimMode::ASYNC);
+        reclaim_lock().store(false, std::memory_order_release);
+        reclaim_creator_pid_ = 0;  // clear so init() won't misdetect fork-child
+        // Reset global stats counters so re-init starts fresh.
+        uballoc::reclaim_stats_enabled().store(true, std::memory_order_relaxed);
+        uballoc::stats_allocated_to_app().store(0, std::memory_order_relaxed);
+        uballoc::stats_freed_from_app().store(0, std::memory_order_relaxed);
         affinity_mode().store(static_cast<size_t>(AffinityMode::Strict),
                               std::memory_order_release);
 
@@ -992,9 +1050,56 @@ public:
         GlobalAllocator<BackendT>::get().backend_.check_one_segment_for_reclaim(1);
     }
 
+    static void reclaim_trigger_static() {
+        auto* rt = get().reclaim_thread_.get();
+        if (rt) rt->trigger_now();
+    }
+
+    static void scan_all_segments_static() {
+        GlobalAllocator<BackendT>::get().scan_all_segments_impl();
+    }
+
+    static uint64_t compute_reclaim_deadline_static() {
+        return GlobalAllocator<BackendT>::get().backend_.compute_next_reclaim_deadline_ns();
+    }
+
+    // Shared lock for scan_all_segments and check_remote_segments.
+    // Uses atomic flag instead of std::mutex — fork-safe because
+    // soft_reset() clears the flag (no inherited locked state).
+    static std::atomic<bool>& reclaim_lock() {
+        static std::atomic<bool> locked{false};
+        return locked;
+    }
+
+    // Try to acquire reclaim lock (non-blocking).
+    bool try_reclaim_lock() {
+        bool expected = false;
+        return reclaim_lock().compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    void release_reclaim_lock() {
+        reclaim_lock().store(false, std::memory_order_release);
+    }
+
+    void scan_all_segments_impl() {
+        if (!try_reclaim_lock()) return;
+        // collect() does only state checks — microsecond-level lock hold.
+        auto actions = backend_.scan_all_segments_collect();
+        release_reclaim_lock();
+        // execute() does the slow I/O (munmap, shm_unlink, shm_exists)
+        // without holding reclaim_lock, so check_remote_segments and purge
+        // don't block.
+        backend_.scan_all_segments_execute(actions);
+    }
+
     void purge() {
         init();
+        // Block until reclaim_lock is available — purge is user-called and
+        // must not race with background scan.
+        acquire_reclaim_lock_blocking();
         backend_.return_segment_purge();
+        release_reclaim_lock();
     }
 
     ReturnStats return_stats() {
@@ -1063,24 +1168,21 @@ public:
         }
     }
 
+    // Blocking acquire of reclaim_lock for cold paths that MUST NOT skip.
+    // Used by check_remote_segments and purge — both are cold paths where
+    // skipping causes free leaks or state races. Blocks until reclaim_lock
+    // is available. Lock hold is microsecond-level (only collect runs under
+    // it; I/O executes outside).
+    void acquire_reclaim_lock_blocking() {
+        while (!try_reclaim_lock()) {
+            std::this_thread::yield();
+        }
+    }
+
     void check_remote_segments() {
-        // Thread-safe: multiple worker threads call this via
-        // check_remote_fn() (from Heap::peek → malloc, free_offset,
-        // grow_segment). Without this mutex, concurrent calls cause
-        // double-attach (multiple attach_with_refcount calls for the
-        // same segment → refcount inflated → shm_detach_by_name never
-        // called → device imports leak → remote process hangs in
-        // wait_for_unreferenced).
-        //
-        // Performance: only called when local free list is empty (cold
-        // path). Most calls are no-ops (no new segments). Mutex
-        // overhead is negligible.
-        //
-        // No deadlock: attach_new_processes, wire_up_process, and
-        // backend_.check_remote_segments do NOT call check_remote_segments
-        // recursively.
-        static std::mutex check_mtx;
-        std::lock_guard<std::mutex> lk(check_mtx);
+        // Cold path: MUST NOT skip (skipping causes free drops and missed
+        // peer discovery). Block until reclaim_lock is available.
+        acquire_reclaim_lock_blocking();
 
         backend_.attach_new_processes();
 
@@ -1132,6 +1234,8 @@ public:
                 }
             }
         }
+
+        release_reclaim_lock();
     }
 
     Allocator<void, void>& current_allocator() {
@@ -1511,6 +1615,10 @@ inline PublishedInfo lookup_by_address(void* ptr) {
 
 inline void reset() {
     get_global_allocator().reset();
+}
+
+inline void soft_reset() {
+    get_global_allocator().soft_reset();
 }
 
 inline bool is_initialized() {

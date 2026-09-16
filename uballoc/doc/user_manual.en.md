@@ -25,6 +25,8 @@ Applicable scenarios: allocation, free, publish, discovery, and cross-node acces
 | type_id-based publish/discovery | `malloc(size, type_id)` performs allocation and publish in one call; any process can discover regions published by others via `lookup_by_type(type_id)` (blocking or non-blocking). `owner_process` is registered atomically via CAS, guaranteeing a single owner per type_id. |
 | Dynamic membership discovery | After setting the `UBALLOC_HEAP_ID` environment variable, a process discovers its rank and total membership automatically via a bootstrap shared-memory block — no need to know `rank` or `total_processes` in advance. |
 | uffd on by default | A constructor at priority 102 automatically installs the uffd handler thread, which loads remote data segments on demand. When uffd is unavailable, it falls back to the SIGSEGV fault handler. `init()` also calls `try_enable_uffd_locked()` at the end. |
+| Asynchronous memory reclaim | Supports SYNC/ASYNC modes for returning idle Small/Large segments to the OS. ASYNC mode (default) uses a background thread with jemalloc-style timed scanning — zero hot-path overhead on malloc/free. SYNC mode triggers inline in malloc/free. The `decay1`/`decay2` timers control the LIVE→DETACHED→RETURNED state machine; `purge()` skips timers for immediate return. |
+| Memory statistics | Query memory flow statistics via `return_stats()`: bytes requested from OS, bytes returned to OS, bytes allocated to app, bytes freed by app, current held/in-use, efficiency ratio, etc. In ASYNC mode, the background thread auto-emits `[RECLAIM-STATS]` log every 30 scans. |
 | CRTP zero-overhead backend | The backend dispatches statically via CRTP — no virtual calls on the allocation hot path. ARMv8.1 LSE atomics are optional, compile-time toggleable. |
 | Crash recovery | Three optional mechanisms — detectable CAS, state logging, cache flushing — support post-crack scan-and-rebuild of allocator state. |
 
@@ -143,7 +145,6 @@ After a successful build, the following artifacts are generated under `build/`:
 | `dynamic_discovery_example` | Demonstrates `UBALLOC_HEAP_ID`-driven dynamic membership discovery |
 | `distributed_example` | Demonstrates multi-tier allocation, `lookup_by_address`, and cross-process remote free |
 | `stl_full_shm_example` | Demonstrates `shm_new<T>(pub_tid{})` merged-publish STL containers (header+data both in shm) |
-| `stl_data_only_example` | Demonstrates the pattern where STL container data buffers are in shm but headers stay local |
 | `uballoc_test` | Unit tests (`ctest` entry point) |
 
 ## Usage
@@ -316,6 +317,7 @@ For detailed steps to obtain source and build, see [Installation Guide](#install
 | `uffd_example` | uffd-on-by-default coexisting with eager-attach example |
 | `dynamic_discovery_example` | `UBALLOC_HEAP_ID` dynamic membership-discovery example |
 | `stl_full_shm_example` | `shm_new<T>(pub_tid{})` merged-publish STL container example |
+| `reclaim_example` | Async memory reclaim demo (SYNC/ASYNC modes, LIVE→DETACHED→RETURNED, purge immediate return) |
 | `uballoc_test` | Unit tests |
 
 ## Environment Variables
@@ -335,6 +337,13 @@ As shown in [**Table 3** uballoc environment variables](#uballoc-environment-var
 | `UBALLOC_RECOVER_LOG` | Compile-time state-logging switch (crash recovery) | `ON` (CMake) | `ON`/`OFF` |
 | `UBALLOC_RECOVER_FLUSH` | Compile-time cache-flushing switch (crash recovery) | `OFF` (CMake) | `ON`/`OFF` |
 | `UBALLOC_LSE` | Compile-time ARMv8.1 LSE atomic-instruction switch | `ON` (CMake) | `ON`/`OFF` |
+| `UBALLOC_RECLAIM_MODE` | Memory reclaim mode: `async` (default) via background thread, `sync` inline in malloc/free | `async` | `async`/`sync` |
+| `UBALLOC_RECLAIM_ENABLED` | Reclaim master switch; set to 0 to disable entirely | `1` | `0`/`1` |
+| `UBALLOC_RECLAIM_DECAY1_MS` | LIVE→DETACHED timeout (ms); time after segment becomes idle before detach | `5000` | any non-negative integer |
+| `UBALLOC_RECLAIM_DECAY2_MS` | DETACHED→RETURNED timeout (ms); time after detach before delete/return to OS | `60000` | any non-negative integer |
+| `UBALLOC_RECLAIM_SCAN_INTERVAL_MS` | ASYNC mode background thread scan interval (ms) | `5000` | any positive integer |
+| `UBALLOC_RECLAIM_STATS` | Memory statistics switch; set to 0 to disable hot-path byte counting (zero overhead) | `1` | `0`/`1` |
+| `UBALLOC_RECLAIM_LOG_STATS_INTERVAL` | ASYNC mode `[RECLAIM-STATS]` log interval (emit every N background scans) | `30` | any positive integer |
 
 ### Environment-variable configuration example
 
@@ -785,6 +794,7 @@ This section covers API that is not required — the vast majority of applicatio
 - You need reverse-lookup publish info by address (`lookup_by_address`);
 - You need to query cluster state (`rank`/`total_processes`/`is_owner`/`is_initialized`);
 - You need a full allocator reset (`reset`);
+- You need to immediately return idle segments to the OS (`purge`) or query memory statistics (`return_stats`);
 - uffd is unavailable and you need to manually enable the SIGSEGV fault handler as fallback (`enable_fault_handler`).
 
 ### uballoc_memalign
@@ -950,10 +960,12 @@ Fully cleans up and resets allocator state. Executes `uffd_uninstall()` → `fh_
 **Definition**
 
 ```cpp
+// C++ API
 void uballoc::reset();
-```
 
-> **Note**: C++ API only.
+// C API
+void uballoc_reset(void);
+```
 
 ### uballoc_enable_fault_handler
 
@@ -1020,6 +1032,139 @@ Disables the uffd handler: stops the handler thread, closes the uffd fd, and `mp
 void uballoc::disable_userfaultfd();
 void uballoc_disable_userfaultfd(void);
 ```
+
+### uballoc_purge
+
+**Description**
+
+Immediately returns all idle segments to the OS, skipping decay1/decay2 timers. For LIVE segments with `live_slab_count==0`, performs detach+delete in one step. For DETACHED segments, performs delete. Use when the application needs to return memory immediately (e.g., batch-processing idle periods).
+
+**Definition**
+
+```cpp
+// C++ API
+void uballoc::purge();
+
+// C API
+void uballoc_purge(void);
+```
+
+**Example**
+
+```cpp
+// Allocate and free a large batch
+std::vector<void*> ptrs;
+for (int i = 0; i < 10000; ++i) ptrs.push_back(uballoc::malloc(1024));
+for (void* p : ptrs) uballoc::free(p);
+ptrs.clear();
+
+// Immediately return idle segments to OS
+uballoc::purge();
+```
+
+### uballoc_return_stats
+
+**Description**
+
+Query memory reclaim statistics: segment state snapshot, cumulative transition counts, byte-level memory flow statistics.
+
+**Definition**
+
+```cpp
+// C++ API
+uballoc::ReturnStats uballoc::return_stats();
+
+// C API
+void uballoc_return_stats(uballoc_return_stats_t *out);
+```
+
+**Parameters (C API)**
+
+| Parameter | Description | Range | I/O |
+|-----------|-------------|-------|-----|
+| `out` | Output: filled with stats struct | non-NULL | output |
+
+**`ReturnStats` struct (C++)**
+
+```cpp
+struct ReturnStats {
+    // Segment snapshot (current state counts)
+    size_t segments_live;        // LIVE segments (in use)
+    size_t segments_detached;    // DETACHED segments (pending return)
+    size_t segments_returned;    // RETURNED segments (returned to OS)
+
+    // Cumulative transitions
+    size_t total_detached_count;
+    size_t total_returned_count;
+    size_t total_recreated_count;
+
+    // Byte-level cumulative statistics
+    uint64_t requested_from_os_bytes;   // Total bytes requested from OS
+    uint64_t returned_to_os_bytes;      // Total bytes returned to OS
+    uint64_t allocated_to_app_bytes;    // Total bytes allocated to app
+    uint64_t freed_from_app_bytes;      // Total bytes freed by app
+    uint64_t thrash_events;             // Thrash events (LIVE→DETACHED→LIVE)
+};
+```
+
+**`uballoc_return_stats_t` struct (C API)**
+
+```c
+typedef struct {
+    size_t segments_live;
+    size_t segments_detached;
+    size_t segments_returned;
+    size_t total_detached_count;
+    size_t total_returned_count;
+    size_t total_recreated_count;
+    uint64_t requested_from_os_bytes;
+    uint64_t returned_to_os_bytes;
+    uint64_t allocated_to_app_bytes;
+    uint64_t freed_from_app_bytes;
+    uint64_t thrash_events;
+} uballoc_return_stats_t;
+```
+
+**Computed fields**
+
+| Metric | Formula | Meaning |
+|--------|---------|---------|
+| Currently held | `requested_from_os_bytes - returned_to_os_bytes` | Memory uballoc holds from OS |
+| Currently in use | `allocated_to_app_bytes - freed_from_app_bytes` | Memory app currently occupies |
+| Efficiency | `in_use / held` | High=compact, low=hoarding |
+
+**Example (C++)**
+
+```cpp
+auto stats = uballoc::return_stats();
+uint64_t held = stats.requested_from_os_bytes - stats.returned_to_os_bytes;
+uint64_t in_use = stats.allocated_to_app_bytes - stats.freed_from_app_bytes;
+double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
+
+std::cout << "held=" << held / (1024*1024) << "MB"
+          << " in_use=" << in_use / (1024*1024) << "MB"
+          << " efficiency=" << efficiency << "%"
+          << " live=" << stats.segments_live
+          << " detached=" << stats.segments_detached
+          << " returned=" << stats.segments_returned
+          << std::endl;
+```
+
+**Example (C)**
+
+```c
+uballoc_return_stats_t s;
+uballoc_return_stats(&s);
+uint64_t held = s.requested_from_os_bytes - s.returned_to_os_bytes;
+uint64_t in_use = s.allocated_to_app_bytes - s.freed_from_app_bytes;
+double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
+
+printf("held=%luMB in_use=%luMB efficiency=%.1f%% live=%lu detached=%lu returned=%lu\n",
+       held / (1024*1024), in_use / (1024*1024), efficiency,
+       s.segments_live, s.segments_detached, s.segments_returned);
+```
+
+> **Note**: Set `UBALLOC_RECLAIM_STATS=0` to disable byte-level counting (zero hot-path overhead).
 
 ---
 
@@ -1216,6 +1361,24 @@ The `UBALLOC_HEAP_ID` environment variable can specify the heap_id (default "hea
 ---
 
 The above results are for reference only; actual results may vary.
+
+---
+
+## Memory Reclaim FAQ
+
+### What's the difference between SYNC and ASYNC modes?
+
+| | SYNC mode | ASYNC mode (default) |
+|---|---|---|
+| Trigger | Inline `check_one_segment_for_reclaim` in malloc/free | Background thread timed `scan_all_segments` |
+| Hot-path overhead | One segment scan per malloc/free | Only `trigger_now()` on segment-idle (nanoseconds) |
+| Idle-period reclaim | No reclaim (no malloc/free events) | Reclaims (background thread scans autonomously) |
+| Background thread | None | One per process (fork children skip it) |
+| Use case | Simple scenarios, sustained high throughput | Production, idle-period reclaim |
+
+### Do fork children start a background reclaim thread?
+
+No. Fork children's `init()` detects PID change and skips ReclaimThread creation. Fork children are typically short-lived (alloc+free then `_exit`), so background reclaim is unnecessary. If needed, fork children can use SYNC mode or `purge()`.
 
 ---
 

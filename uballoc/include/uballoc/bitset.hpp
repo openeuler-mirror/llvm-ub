@@ -87,6 +87,10 @@ struct BitSet {
     }
     
     Bit peek_unchecked() const {
+        // sparse==0 means no free bits. __builtin_ctzll(0) is UB, so guard.
+        // Returns Bit(0,0) which is a valid bit index, but pop() checks
+        // detached before using it, so this is safe for reclaimed slabs.
+        if (sparse == 0) return Bit(u6(0), u6(0));
         uint8_t row = __builtin_ctzll(sparse);
         uint8_t col = __builtin_ctzll(dense[row]);
         return Bit(u6(col), u6(row));

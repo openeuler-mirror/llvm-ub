@@ -85,4 +85,23 @@ bool uballoc_is_initialized(void) {
     return uballoc::get_global_allocator().is_initialized();
 }
 
+void uballoc_purge(void) {
+    uballoc::get_global_allocator().purge();
+}
+
+void uballoc_return_stats(uballoc_return_stats_t *out) {
+    if (!out) return;
+    uballoc::get_global_allocator().init();
+    uballoc::ReturnStats s = uballoc::return_stats();
+    out->segments_live         = s.segments_live;
+    out->segments_detached     = s.segments_detached;
+    out->segments_returned     = s.segments_returned;
+    out->total_detached_count  = s.total_detached_count;
+    out->total_returned_count  = s.total_returned_count;
+    out->requested_from_os_bytes = s.requested_from_os_bytes;
+    out->returned_to_os_bytes    = s.returned_to_os_bytes;
+    out->allocated_to_app_bytes  = s.allocated_to_app_bytes;
+    out->freed_from_app_bytes    = s.freed_from_app_bytes;
+}
+
 }

@@ -23,6 +23,7 @@
 #include "stat.hpp"
 #include "log.hpp"
 #include "segment.hpp"
+#include "reclaim_mode.hpp"
 #include <chrono>
 
 struct RecoverState;
@@ -323,9 +324,26 @@ struct Heap {
     }
 
     void* pop(ThreadId id, B class_, SlabIndex<B> idx, Bit block) {
+        SlabLocal<B>& local = slabs->local(idx);
+
+        // Reclaim safety (see delete_segment race analysis): (idx, block)
+        // may be stale if the segment was reclaimed between peek() and
+        // pop() — the caller may even have been preempted in between.
+        //   - Old device content (fault-handler rescued): detached==1.
+        //   - Anon zero-page window: detached==0 but the bit is cleared.
+        // Either way the slab is being reclaimed → return nullptr and let
+        // the caller retry peek() with a fresh slab.
+        if (local.detached.load(std::memory_order_acquire) != 0) return nullptr;
+        if ((local.free.dense[block.row] & (1ULL << block.col)) == 0) return nullptr;
+
         stat_recorder->record(id, stat::thread::EventType::Allocate, class_.size(), class_);
 
-        SlabLocal<B>& local = slabs->local(idx);
+        // Track bytes allocated to app
+        if (uballoc::reclaim_stats_enabled().load(std::memory_order_relaxed)) {
+            uballoc::stats_allocated_to_app().fetch_add(
+                class_.size(), std::memory_order_relaxed);
+        }
+
         assert((local.free.dense[block.row] & (1ULL << block.col)) != 0);
 
         size_t count_before = local.free.len();
@@ -351,26 +369,43 @@ struct Heap {
     }
 
     std::optional<std::pair<SlabIndex<B>, Bit>> peek(ThreadId id, B class_) {
-        auto idx = owned->sized[class_].peek();
-        if (!idx) {
-            idx = allocate(id, class_);
-            if (!idx) return std::nullopt;
-        }
+        while (true) {
+            auto idx = owned->sized[class_].peek();
+            if (!idx) {
+                idx = allocate(id, class_);
+                if (!idx) return std::nullopt;
+            }
 
-        SlabLocal<B>& local = slabs->local(*idx);
-        Bit block = local.free.peek_unchecked();
-        return std::make_pair(*idx, block);
+            SlabLocal<B>& local = slabs->local(*idx);
+            // Reclaim safety (see delete_segment race analysis):
+            //  - detached==1: segment was reclaimed; purge stale head, retry
+            //  - detached==0 but the peeked free-bit is not set: transient
+            //    zero-page window of a segment being reclaimed (anon remap
+            //    happened, detached=1 store not yet observed) — treat as
+            //    stale, purge, retry. For a healthy slab the bit from
+            //    peek_unchecked is always set, so this never misfires.
+            if (local.detached.load(std::memory_order_acquire) != 0 ||
+                (local.free.dense[local.free.peek_unchecked().row] &
+                 (1ULL << local.free.peek_unchecked().col)) == 0) {
+                owned->sized[class_].pop(*slabs);  // purge stale head
+                continue;
+            }
+            Bit block = local.free.peek_unchecked();
+            return std::make_pair(*idx, block);
+        }
     }
 
     std::optional<SlabIndex<B>> allocate(ThreadId id, B class_) {
         if (class_.is_zero()) return std::nullopt;
 
-        if constexpr (std::is_same_v<B, Small>) {
-            auto fn = reclaim_fn_small().load(std::memory_order_acquire);
-            if (fn) fn();
-        } else if constexpr (std::is_same_v<B, Large>) {
-            auto fn = reclaim_fn_large().load(std::memory_order_acquire);
-            if (fn) fn();
+        if (reclaim_mode() == ReclaimMode::SYNC) {
+            if constexpr (std::is_same_v<B, Small>) {
+                auto fn = reclaim_fn_small().load(std::memory_order_acquire);
+                if (fn) fn();
+            } else if constexpr (std::is_same_v<B, Large>) {
+                auto fn = reclaim_fn_large().load(std::memory_order_acquire);
+                if (fn) fn();
+            }
         }
 
         if (owned->unsized_to_sized(id, owned->state, *slabs, class_)) {
@@ -487,12 +522,14 @@ struct Heap {
             free_remote(id, idx);
         }
 
-        if constexpr (std::is_same_v<B, Small>) {
-            auto fn = reclaim_fn_small().load(std::memory_order_acquire);
-            if (fn) fn();
-        } else if constexpr (std::is_same_v<B, Large>) {
-            auto fn = reclaim_fn_large().load(std::memory_order_acquire);
-            if (fn) fn();
+        if (reclaim_mode() == ReclaimMode::SYNC) {
+            if constexpr (std::is_same_v<B, Small>) {
+                auto fn = reclaim_fn_small().load(std::memory_order_acquire);
+                if (fn) fn();
+            } else if constexpr (std::is_same_v<B, Large>) {
+                auto fn = reclaim_fn_large().load(std::memory_order_acquire);
+                if (fn) fn();
+            }
         }
     }
 
@@ -501,6 +538,12 @@ struct Heap {
         Bit block = data->into_block(offset, class_);
 
         stat_recorder->record(id, stat::thread::EventType::Free, class_.size(), class_);
+
+        // Track bytes freed from app
+        if (uballoc::reclaim_stats_enabled().load(std::memory_order_relaxed)) {
+            uballoc::stats_freed_from_app().fetch_add(
+                class_.size(), std::memory_order_relaxed);
+        }
 
         SlabLocal<B>& local = slabs->local(idx);
         local.free.set(block);
@@ -523,6 +566,8 @@ struct Heap {
                 auto tp = std::chrono::steady_clock::now().time_since_epoch();
                 uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(tp).count();
                 hdr->free_since_ns.store(now_ns, std::memory_order_release);
+                auto trigger = reclaim_trigger_fn().load(std::memory_order_acquire);
+                if (trigger) trigger();
             }
         }
 
@@ -534,6 +579,12 @@ struct Heap {
         B class_ = B::from_index(class_raw).value_or(B());
 
         stat_recorder->record(id, stat::thread::EventType::Free, class_.size(), class_);
+
+        // Track bytes freed from app (remote free path)
+        if (class_.size() > 0 && uballoc::reclaim_stats_enabled().load(std::memory_order_relaxed)) {
+            uballoc::stats_freed_from_app().fetch_add(
+                class_.size(), std::memory_order_relaxed);
+        }
 
         auto& remote = slabs->remote(idx);
 
@@ -571,6 +622,8 @@ struct Heap {
                     auto tp = std::chrono::steady_clock::now().time_since_epoch();
                     uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(tp).count();
                     hdr->free_since_ns.store(now_ns, std::memory_order_release);
+                    auto trigger = reclaim_trigger_fn().load(std::memory_order_acquire);
+                    if (trigger) trigger();
                 }
             }
         }

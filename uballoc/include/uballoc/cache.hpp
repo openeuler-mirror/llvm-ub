@@ -51,6 +51,18 @@ inline std::atomic<ReclaimFn>& reclaim_fn_large() {
     return fn;
 }
 
+// ReclaimThread wake trigger. Called from heap.hpp free_offset when
+// a segment becomes fully idle (live_slab_count drops to 0). This
+// is the jemalloc "pac_maybe_wake_bg" pattern: the hot path doesn't
+// scan, it just pokes the background thread to re-evaluate its deadline
+// and wake from indefinite sleep.
+using ReclaimTriggerFn = void(*)();
+
+inline std::atomic<ReclaimTriggerFn>& reclaim_trigger_fn() {
+    static std::atomic<ReclaimTriggerFn> fn{nullptr};
+    return fn;
+}
+
 enum class AffinityMode : size_t {
     Strict     = 0,
     ReuseFirst = 1,
@@ -67,8 +79,29 @@ struct ReturnStats {
     size_t segments_returned = 0;
     size_t total_detached_count = 0;
     size_t total_returned_count = 0;
-    size_t total_recreated_count = 0;
+    uint64_t requested_from_os_bytes = 0;
+    uint64_t returned_to_os_bytes = 0;
+    uint64_t allocated_to_app_bytes = 0;
+    uint64_t freed_from_app_bytes = 0;
 };
+
+// Global atomic counters for hot-path byte tracking.
+// heap.hpp (templated on B=Small/Large) can't access BackendT members,
+// so these are global — same pattern as grow_fn_small()/reclaim_fn_small().
+inline std::atomic<bool>& reclaim_stats_enabled() {
+    static std::atomic<bool> enabled{true};
+    return enabled;
+}
+
+inline std::atomic<uint64_t>& stats_allocated_to_app() {
+    static std::atomic<uint64_t> v{0};
+    return v;
+}
+
+inline std::atomic<uint64_t>& stats_freed_from_app() {
+    static std::atomic<uint64_t> v{0};
+    return v;
+}
 
 enum class Invalidate { No, Yes };
 
