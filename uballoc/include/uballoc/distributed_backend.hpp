@@ -366,27 +366,48 @@ public:
     size_t reclaim_scan_large_cursor_ = 0;
     size_t total_detached_count_ = 0;
     size_t total_returned_count_ = 0;
-    size_t total_recreated_count_ = 0;
+
+    // Byte-level stats counters (filled into ReturnStats by return_stats())
+    uint64_t requested_from_os_bytes_ = 0;
+    uint64_t returned_to_os_bytes_ = 0;
+
+    // Periodic [RECLAIM-STATS] log counter
+    uint32_t scan_count_since_stats_ = 0;
+    uint32_t log_stats_interval_ = 30;
 
     void init_reclaim_params() {
-        const char* enabled = std::getenv("UBALLOC_RETURN_ENABLED");
+        const char* enabled = std::getenv("UBALLOC_RECLAIM_ENABLED");
         if (enabled) return_enabled_ = (std::atoi(enabled) != 0);
 
-        const char* d1 = std::getenv("UBALLOC_RETURN_DECAY1_MS");
+        const char* d1 = std::getenv("UBALLOC_RECLAIM_DECAY1_MS");
         if (d1) {
             int ms = std::atoi(d1);
             if (ms >= 0) decay1_ns_ = static_cast<uint64_t>(ms) * 1'000'000ULL;
         }
 
-        const char* d2 = std::getenv("UBALLOC_RETURN_DECAY2_MS");
+        const char* d2 = std::getenv("UBALLOC_RECLAIM_DECAY2_MS");
         if (d2) {
             int ms = std::atoi(d2);
             if (ms >= 0) decay2_ns_ = static_cast<uint64_t>(ms) * 1'000'000ULL;
         }
 
+        const char* se = std::getenv("UBALLOC_RECLAIM_STATS");
+        if (se) {
+            uballoc::reclaim_stats_enabled().store(
+                std::atoi(se) != 0, std::memory_order_relaxed);
+        }
+
+        const char* lsi = std::getenv("UBALLOC_RECLAIM_LOG_STATS_INTERVAL");
+        if (lsi) {
+            int v = std::atoi(lsi);
+            if (v > 0) log_stats_interval_ = static_cast<uint32_t>(v);
+        }
+
         LOG_INFO("init_reclaim_params: enabled=" << return_enabled_
                  << " decay1_ns=" << decay1_ns_
-                 << " decay2_ns=" << decay2_ns_);
+                 << " decay2_ns=" << decay2_ns_
+                 << " stats=" << uballoc::reclaim_stats_enabled().load()
+                 << " log_stats_interval=" << log_stats_interval_);
     }
 
     static uint64_t steady_now_ns() {
@@ -1051,6 +1072,9 @@ public:
 
         LOG_INFO("create_data_segment: bracket=" << bracket << " seg=" << seg_idx
                  << " slabs=" << requested_slabs << " size=" << seg_size);
+
+        requested_from_os_bytes_ += entry.region.size;
+
         return seg_idx;
     }
 
@@ -1092,10 +1116,11 @@ public:
         // decay2 expires), which is called from a SEPARATE reclaim cycle
         // (not inline in allocate/free).
         if (entry.handle != ShmProviderT::INVALID_HANDLE) {
-            // Close fd only — don't call shm_detach_by_name yet (needs
-            // munmap first on UBSE to avoid 1005). The munmap +
-            // shm_detach_by_name happens later in delete_segment.
-            ShmProviderT::shm_close_fd(entry.handle);
+            if constexpr (ShmProviderT::is_single_node) {
+                ShmProviderT::shm_close_fd(entry.handle);
+            }
+            // UBSE: fd closed in delete_segment after anon remap (fault
+            // handler may need it for rescue during the munmap window).
             entry.handle = ShmProviderT::INVALID_HANDLE;
         }
 
@@ -1108,8 +1133,26 @@ public:
         entry.state = SegmentEntry::State::DETACHED;
         total_detached_count_++;
 
-        LOG_INFO("detach_segment: bracket=" << bracket << " seg=" << seg_idx
-                 << " (LIVE->DETACHED)");
+        // Detailed detach log
+        {
+            char* seg_base = static_cast<char*>(entry.region.address);
+            SegmentHeader* hdr = seg_base ? reinterpret_cast<SegmentHeader*>(seg_base) : nullptr;
+            uint64_t idle_ns = hdr ? (steady_now_ns() - hdr->free_since_ns.load(std::memory_order_relaxed)) : 0;
+            size_t slab_count = 0;
+            if (bracket == 0) slab_count = SegmentLayout<Small>::compute(
+                SegmentLayout<Small>::virtual_slabs_per_segment()).slab_count;
+            else if (bracket == 1) slab_count = SegmentLayout<Large>::compute(
+                SegmentLayout<Large>::virtual_slabs_per_segment()).slab_count;
+
+            LOG_INFO("[RECLAIM] DETACH bracket=" << bracket
+                     << " seg=" << seg_idx
+                     << " slab_count=" << slab_count
+                     << " live_slab_count=" << (hdr ? hdr->live_slab_count.load(std::memory_order_relaxed) : 0)
+                     << " idle_ns=" << idle_ns
+                     << " decay1_ns=" << decay1_ns_
+                     << " state=LIVE→DETACHED"
+                     << " va=0x" << std::hex << reinterpret_cast<uintptr_t>(entry.region.address) << std::dec);
+        }
     }
 
     void delete_segment(int bracket, int seg_idx) {
@@ -1124,23 +1167,21 @@ public:
         RegionType rt = static_cast<RegionType>(bracket + 1);
         std::string name = ShmProviderT::shm_name(heap_id_, rank_, rt, seg_idx);
 
-        // On UBSE: munmap + shm_detach_by_name BEFORE shm_delete.
-        // munmap must happen before shm_detach (1005 if active mmap).
-        // shm_detach must happen before shm_delete (1024 if import active).
         if constexpr (!ShmProviderT::is_single_node) {
             void* addr = entry.region.address;
             size_t size = entry.region.size;
 
             if (addr && size > 0) {
+                // NOTE: fault-handler entry and device fd are intentionally
+                // STILL VALID here — they rescue Window A faults (see above).
+
                 ::munmap(addr, size);
 
                 // Re-mmap anonymous at the same address (MAP_FIXED) so the
-                // slab layer can safely access SlabLocal (which lives in
-                // the data segment at slab_local_offset). Without this,
-                // pop() would segfault when accessing slabs.local(idx).next
-                // for a slab whose SlabLocal was in the just-munmap'd
-                // segment. The new mapping is zero-filled; we set
-                // detached=1 + next=0 below so pop skips these slabs.
+                // slab layer can safely access SlabLocal. The new mapping
+                // is zero-filled; we set detached=1 + next=0 + sparse=0
+                // so pop skips these slabs and peek/pop validation treats
+                // the transient zero-page window as stale (nullptr/retry).
                 void* new_addr = ::mmap(addr, size, PROT_READ | PROT_WRITE,
                                         MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
                                         -1, 0);
@@ -1155,6 +1196,8 @@ public:
                         for (size_t i = 0; i < sl.slab_count; ++i) {
                             slab_arr[i].next.store(0, std::memory_order_relaxed);
                             slab_arr[i].detached.store(1, std::memory_order_release);
+                            slab_arr[i].free.sparse = 0;
+                            slab_arr[i].free.count = 0;
                         }
                     } else if (bracket == 1) {
                         auto sl = SegmentLayout<Large>::compute(
@@ -1165,12 +1208,22 @@ public:
                         for (size_t i = 0; i < sl.slab_count; ++i) {
                             slab_arr[i].next.store(0, std::memory_order_relaxed);
                             slab_arr[i].detached.store(1, std::memory_order_release);
+                            slab_arr[i].free.sparse = 0;
+                            slab_arr[i].free.count = 0;
                         }
                     }
                 } else {
                     LOG_ERROR("delete_segment: re-mmap anonymous failed, "
                              << "bracket=" << bracket << " seg=" << seg_idx
                              << " errno=" << errno);
+                }
+
+                // Close device fd. fh_invalidate_segment closes the fd
+                // it cached; we also close entry.handle if not already.
+                fh_invalidate_segment(reinterpret_cast<uintptr_t>(addr));
+                if (entry.handle != ShmProviderT::INVALID_HANDLE) {
+                    ShmProviderT::shm_close_fd(entry.handle);
+                    entry.handle = ShmProviderT::INVALID_HANDLE;
                 }
             }
 
@@ -1179,28 +1232,56 @@ public:
             ShmProviderT::shm_detach_by_name(name);
         }
 
+        // shm_unlink internally does detach + retry shm_delete for 1s.
+        // On UBSE, the daemon processes detach asynchronously, so we
+        // poll shm_exists for up to 2s after shm_unlink returns.
         ShmProviderT::shm_unlink(name);
 
-        // On UBSE, shm_delete may fail with 1024 (ATTACH_USING) if
-        // cross-node borrowers are still attached. Check if the delete
-        // actually succeeded. If not, keep DETACHED state and retry on
-        // the next check_one_segment_for_reclaim / return_segment_purge.
         if constexpr (!ShmProviderT::is_single_node) {
-            if (ShmProviderT::shm_exists(name)) {
-                LOG_INFO("delete_segment: shm_delete pending (borrowers still "
-                         "attached), bracket=" << bracket << " seg=" << seg_idx);
-                entry.state = SegmentEntry::State::DETACHED;
+            // UBSE: shm_unlink does detach + retry shm_delete internally.
+            // Check once if the delete completed; if not, leave as
+            // DETACHED for next scan to retry. Do NOT poll in the hot
+            // path (SYNC mode) — it blocks malloc/free for up to 2s.
+            if (!ShmProviderT::shm_exists(name)) {
+                returned_to_os_bytes_ += entry.region.size;
+                entry.state = SegmentEntry::State::RETURNED;
+                total_returned_count_++;
+                {
+                    uint64_t detached_ns = steady_now_ns() - entry.detached_since_ns;
+                    LOG_INFO("[RECLAIM] DELETE bracket=" << bracket
+                             << " seg=" << seg_idx
+                             << " detached_ns=" << detached_ns
+                             << " decay2_ns=" << decay2_ns_
+                             << " shm_name=" << name
+                             << " shm_delete_result=OK"
+                             << " state=DETACHED→RETURNED"
+                             << " returned_bytes=" << entry.region.size);
+                }
                 return;
             }
+            LOG_INFO("delete_segment: shm_delete pending, bracket=" << bracket
+                     << " seg=" << seg_idx);
+            entry.state = SegmentEntry::State::DETACHED;
+            return;
         }
 
-        // Don't clear entry.region.address — it now points to the
-        // anonymous mapping kept alive for the slab layer.
+        // POSIX path: shm_unlink is immediate, segment is RETURNED.
+        returned_to_os_bytes_ += entry.region.size;
         entry.state = SegmentEntry::State::RETURNED;
         total_returned_count_++;
 
-        LOG_INFO("delete_segment: bracket=" << bracket << " seg=" << seg_idx
-                 << " (DETACHED->RETURNED)");
+        // Detailed delete log
+        {
+            uint64_t detached_ns = steady_now_ns() - entry.detached_since_ns;
+            LOG_INFO("[RECLAIM] DELETE bracket=" << bracket
+                     << " seg=" << seg_idx
+                     << " detached_ns=" << detached_ns
+                     << " decay2_ns=" << decay2_ns_
+                     << " shm_name=" << name
+                     << " shm_delete_result=OK"
+                     << " state=DETACHED→RETURNED"
+                     << " returned_bytes=" << entry.region.size);
+        }
     }
 
     void check_one_segment_for_reclaim(int bracket) {
@@ -1228,15 +1309,11 @@ public:
             uint64_t since = hdr->free_since_ns.load(std::memory_order_acquire);
             if (since == 0 || now - since < decay1_ns_) return;
             detach_segment(bracket, static_cast<int>(idx));
+        } else if (state == SegmentEntry::State::DETACHED) {
+            uint64_t since = entry.detached_since_ns;
+            if (since == 0 || now - since < decay2_ns_) return;
+            delete_segment(bracket, static_cast<int>(idx));
         }
-        // NOTE: DETACHED→RETURNED is NOT done here. delete_segment munmaps
-        // the data segment, but this function is called inline inside
-        // allocate()/free_offset() (via reclaim_fn_small/large). After the
-        // reclaim returns, the caller may access slab metadata through
-        // *slabs which points into the just-munmap'd segment → segfault.
-        // The DETACHED→RETURNED transition (munmap + shm_detach + shm_delete)
-        // happens only in return_segment_purge, called via purge() from
-        // OUTSIDE allocate/free.
     }
 
     void return_segment_purge() {
@@ -1260,6 +1337,212 @@ public:
         }
     }
 
+    // Collected actions for deferred execution outside the lock.
+    struct PendingAction {
+        int bracket;
+        int seg_idx;
+        bool is_delete;  // false = detach, true = delete
+    };
+    struct BorrowerAction {
+        int lender_rank;
+        int bracket;
+        int seg_idx;
+    };
+    struct ScanActions {
+        std::vector<PendingAction> pending;
+        std::vector<BorrowerAction> borrower_detach;
+        std::vector<BorrowerAction> borrower_check;
+        uint64_t now;
+    };
+
+    // Phase 1-3: collect segments that need action (fast, no I/O).
+    // Runs under reclaim_lock — microsecond-level hold.
+    ScanActions scan_all_segments_collect() {
+        ScanActions actions;
+        actions.now = steady_now_ns();
+        uint64_t now = actions.now;
+
+        // Phase 1+2: own segments LIVE→DETACHED (decay1) / DETACHED→RETURNED (decay2)
+        for (int b = 0; b < 2; ++b) {
+            auto& segs = segments_[rank_][b];
+            for (size_t idx = 0; idx < segs.size(); ++idx) {
+                auto& entry = segs[idx];
+                auto state = entry.state;
+                if (state == SegmentEntry::State::LIVE) {
+                    char* seg_base = static_cast<char*>(entry.region.address);
+                    if (!seg_base) continue;
+                    SegmentHeader* hdr = reinterpret_cast<SegmentHeader*>(seg_base);
+                    if (hdr->live_slab_count.load(std::memory_order_acquire) > 0) continue;
+                    uint64_t since = hdr->free_since_ns.load(std::memory_order_acquire);
+                    if (since == 0 || now - since < decay1_ns_) continue;
+                    actions.pending.push_back({b, static_cast<int>(idx), false});
+                } else if (state == SegmentEntry::State::DETACHED) {
+                    uint64_t since = entry.detached_since_ns;
+                    if (since == 0 || now - since < decay2_ns_) continue;
+                    actions.pending.push_back({b, static_cast<int>(idx), true});
+                }
+            }
+        }
+
+        // Phase 3: borrower-side cleanup — collect remote segments whose
+        // lender has detached (ready==0).
+        for (int k = 0; k < total_processes_; ++k) {
+            if (k == rank_) continue;
+            for (int b = 0; b < 2; ++b) {
+                SegmentDirectory* dir = segment_directory(k, b);
+                if (!dir) continue;
+                int avail = static_cast<int>(segments_[k][b].size());
+                for (int s = 0; s < avail; ++s) {
+                    auto& seg = segments_[k][b][s];
+                    if (seg.state == SegmentEntry::State::LIVE) {
+                        if (reinterpret_cast<const volatile uint32_t*>(
+                                &dir->descs[s].ready)[0] != 0) continue;
+                        actions.borrower_detach.push_back({k, b, s});
+                    } else if (seg.state == SegmentEntry::State::DETACHED) {
+                        actions.borrower_check.push_back({k, b, s});
+                    }
+                }
+            }
+        }
+
+        return actions;
+    }
+
+    // Execute collected actions (slow, I/O). Runs WITHOUT reclaim_lock.
+    void scan_all_segments_execute(ScanActions& actions) {
+        uint64_t now = actions.now;
+
+        // Execute own-segment detach/delete.
+        for (auto& a : actions.pending) {
+            if (a.is_delete) {
+                delete_segment(a.bracket, a.seg_idx);
+            } else {
+                detach_segment(a.bracket, a.seg_idx);
+            }
+        }
+
+        // Execute borrower-side cleanup.
+        for (auto& a : actions.borrower_detach) {
+            auto& seg = segments_[a.lender_rank][a.bracket][a.seg_idx];
+            if (seg.state != SegmentEntry::State::LIVE) continue;
+            RegionType rt = static_cast<RegionType>(a.bracket + 1);
+            if (seg.region.address && seg.region.size > 0) {
+                ::munmap(seg.region.address, seg.region.size);
+                seg.region.address = nullptr;
+                seg.region.size = 0;
+            }
+            if (seg.handle != ShmProviderT::INVALID_HANDLE) {
+                detach_with_refcount(a.lender_rank, rt, a.seg_idx, seg.handle);
+                seg.handle = ShmProviderT::INVALID_HANDLE;
+            }
+            seg.state = SegmentEntry::State::DETACHED;
+            seg.detached_since_ns = now;
+        }
+        for (auto& a : actions.borrower_check) {
+            auto& seg = segments_[a.lender_rank][a.bracket][a.seg_idx];
+            if (seg.state != SegmentEntry::State::DETACHED) continue;
+            RegionType rt = static_cast<RegionType>(a.bracket + 1);
+            std::string name = ShmProviderT::shm_name(heap_id_, a.lender_rank,
+                static_cast<int>(rt), a.seg_idx);
+            bool exists = ShmProviderT::shm_exists(name);
+            if (!exists) {
+                seg.state = SegmentEntry::State::RETURNED;
+            }
+        }
+
+        // Phase 4: borrower-side cleanup for uffd-lazy-attached segments.
+        {
+            std::lock_guard<std::mutex> lk(g_uffd_attached_mtx);
+            for (auto it = g_uffd_attached.begin(); it != g_uffd_attached.end(); ) {
+                auto& e = *it;
+                int k = e.lender_rank;
+                int b = e.region_type - 1;
+                if (k < 0 || k >= total_processes_ || b < 0 || b >= 2) { ++it; continue; }
+
+                SegmentDirectory* dir = segment_directory(k, b);
+                if (!dir || e.seg_idx >= static_cast<int>(MAX_SEGMENTS)) { ++it; continue; }
+
+                if (reinterpret_cast<const volatile uint32_t*>(
+                        &dir->descs[e.seg_idx].ready)[0] == 0) {
+                    if (e.addr && e.size > 0) {
+                        ::munmap(e.addr, e.size);
+                        e.addr = nullptr;
+                        e.size = 0;
+                    }
+                    if (e.size > 0 || e.handle_buf[0] != 0) {
+                        ShmHandle h;
+                        std::memcpy(&h, e.handle_buf, sizeof(ShmHandle));
+                        if (h != ShmProviderT::INVALID_HANDLE) {
+                            ShmProviderT::shm_close_fd(h);
+                        }
+                    }
+                    RegionType rt = static_cast<RegionType>(e.region_type);
+                    std::string name = ShmProviderT::shm_name(heap_id_, k,
+                        static_cast<int>(rt), e.seg_idx);
+                    ShmProviderT::shm_detach_by_name(name);
+                    it = g_uffd_attached.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // Periodic [RECLAIM-STATS] log.
+        if (uballoc::reclaim_stats_enabled().load(std::memory_order_relaxed) &&
+            ++scan_count_since_stats_ >= log_stats_interval_) {
+            scan_count_since_stats_ = 0;
+            ReturnStats s = return_stats();
+            uint64_t held = (s.requested_from_os_bytes >= s.returned_to_os_bytes)
+                ? (s.requested_from_os_bytes - s.returned_to_os_bytes) : 0;
+            uint64_t in_use = (s.allocated_to_app_bytes >= s.freed_from_app_bytes)
+                ? (s.allocated_to_app_bytes - s.freed_from_app_bytes) : 0;
+            double eff = (held > 0) ? 100.0 * static_cast<double>(in_use) / static_cast<double>(held) : 0.0;
+            LOG_INFO("[RECLAIM-STATS]"
+                     << " held=" << held / (1024 * 1024) << "MB"
+                     << " in_use=" << in_use / (1024 * 1024) << "MB"
+                     << " efficiency=" << eff << "%"
+                     << " live=" << s.segments_live
+                     << " detached=" << s.segments_detached
+                     << " returned=" << s.segments_returned
+                     << " total_detached=" << s.total_detached_count
+                     << " total_returned=" << s.total_returned_count);
+        }
+    }
+
+    // Accessors for ReclaimThread to read decay timers and find pending work.
+    uint64_t decay1_ns() const { return decay1_ns_; }
+    uint64_t decay2_ns() const { return decay2_ns_; }
+    bool return_enabled() const { return return_enabled_; }
+
+    // Compute next earliest deadline (ns since epoch) for ReclaimThread's
+    // jemalloc-style sleep. Returns UINT64_MAX if no pending work.
+    uint64_t compute_next_reclaim_deadline_ns() const {
+        if (!return_enabled_ || rank_ < 0) return UINT64_MAX;
+        uint64_t earliest = UINT64_MAX;
+
+        for (int b = 0; b < 2; ++b) {
+            const auto& segs = segments_[rank_][b];
+            for (const auto& entry : segs) {
+                if (entry.state == SegmentEntry::State::DETACHED) {
+                    uint64_t deadline = entry.detached_since_ns + decay2_ns_;
+                    if (deadline < earliest) earliest = deadline;
+                } else if (entry.state == SegmentEntry::State::LIVE) {
+                    const char* seg_base = static_cast<const char*>(entry.region.address);
+                    if (!seg_base) continue;
+                    const SegmentHeader* hdr = reinterpret_cast<const SegmentHeader*>(seg_base);
+                    if (hdr->live_slab_count.load(std::memory_order_acquire) == 0) {
+                        uint64_t since = hdr->free_since_ns.load(std::memory_order_acquire);
+                        if (since > 0) {
+                            uint64_t deadline = since + decay1_ns_;
+                            if (deadline < earliest) earliest = deadline;
+                        }
+                    }
+                }
+            }
+        }
+        return earliest;
+    }
+
     ReturnStats return_stats() const {
         ReturnStats stats;
         if (rank_ < 0) return stats;
@@ -1273,7 +1556,10 @@ public:
         }
         stats.total_detached_count = total_detached_count_;
         stats.total_returned_count = total_returned_count_;
-        stats.total_recreated_count = total_recreated_count_;
+        stats.requested_from_os_bytes = requested_from_os_bytes_;
+        stats.returned_to_os_bytes = returned_to_os_bytes_;
+        stats.allocated_to_app_bytes = uballoc::stats_allocated_to_app().load(std::memory_order_relaxed);
+        stats.freed_from_app_bytes = uballoc::stats_freed_from_app().load(std::memory_order_relaxed);
         return stats;
     }
 

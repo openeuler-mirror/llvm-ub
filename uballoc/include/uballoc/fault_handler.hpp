@@ -181,6 +181,15 @@ inline void fh_invalidate_segment(uintptr_t va) {
     for (size_t i = 0; i < FH_MAX_ENTRIES; ++i) {
         if (g_fh_entries[i].va.load(std::memory_order_relaxed) == va) {
             g_fh_entries[i].valid.store(0, std::memory_order_release);
+            // Close the cached fd BEFORE clearing it. On UBSE, this fd
+            // represents an active attach/borrow — leaking it (storing -1
+            // without closing) causes shm_delete to fail with 1024
+            // (ATTACH_USING) because the daemon still sees an active
+            // attach for this shm.
+            int fd = g_fh_entries[i].fd.load(std::memory_order_relaxed);
+            if (fd >= 0) {
+                ::close(fd);
+            }
             g_fh_entries[i].fd.store(-1, std::memory_order_relaxed);
             g_fh_entries[i].attached.store(0, std::memory_order_relaxed);
             g_fh_entries[i].va.store(0, std::memory_order_release);

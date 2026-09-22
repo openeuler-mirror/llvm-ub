@@ -162,6 +162,40 @@ void uballoc_soft_reset(void);
 bool uballoc_is_initialized(void);
 
 /* -------------------------------------------------------------------------
+ * Memory reclaim API.
+ *
+ * uballoc_purge(): Immediately return all idle segments to the OS,
+ *                  skipping decay timers. For LIVE segments with
+ *                  live_slab_count==0, performs detach+delete in one
+ *                  step; for DETACHED segments, performs delete.
+ *
+ * uballoc_return_stats(): Query memory reclaim statistics. Fills the
+ *                         output struct with segment state counts,
+ *                         cumulative transition counts, and byte-level
+ *                         memory flow statistics.
+ * ------------------------------------------------------------------------- */
+void uballoc_purge(void);
+
+typedef struct {
+    /* Segment snapshot (current state counts) */
+    size_t segments_live;
+    size_t segments_detached;
+    size_t segments_returned;
+
+    /* Cumulative transitions */
+    size_t total_detached_count;
+    size_t total_returned_count;
+
+    /* Byte-level cumulative statistics */
+    uint64_t requested_from_os_bytes;
+    uint64_t returned_to_os_bytes;
+    uint64_t allocated_to_app_bytes;
+    uint64_t freed_from_app_bytes;
+} uballoc_return_stats_t;
+
+void uballoc_return_stats(uballoc_return_stats_t *out);
+
+/* -------------------------------------------------------------------------
  * Macro overload: uballoc_malloc(...) dispatches to uballoc_malloc_published
  * when called with 2 arguments (size, type_id), or to uballoc_malloc when
  * called with 1 argument (size). This provides a uniform call site:

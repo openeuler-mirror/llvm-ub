@@ -25,6 +25,8 @@ uballoc是专为aarch64架构、Linux操作系统下多进程多节点分布式�
 | 基于type_id的发布/发现 | 调用`malloc(size, type_id)`一次完成分配与发布；任一进程可通过`lookup_by_type(type_id)`阻塞或非阻塞地发现其他进程发布的区域，`owner_process`通过CAS原子登记，保证一种type_id只有一个所有者。 |
 | 动态成员发现 | 设置环境变量`UBALLOC_HEAP_ID`后，进程通过自举（bootstrap）共享内存块自动发现rank与总成员数，无需提前知晓`rank`或`total_processes`。 |
 | uffd默认开启 | 构造器优先级102自动装配uffd handler线程，按需加载远端数据段；当uffd不可用时，回退至SIGSEGV fault handler。`init()`末尾亦会调用`try_enable_uffd_locked()`。 |
+| 异步内存归还 | 支持SYNC/ASYNC两种模式将空闲段（Small/Large）归还给操作系统。ASYNC模式（默认）由后台线程定时扫描归还，malloc/free热路径零开销；SYNC模式在malloc/free内联触发。通过`decay1`/`decay2`定时器控制LIVE→DETACHED→RETURNED状态机转换，`purge()`可跳过定时器立即归还。 |
+| 内存统计 | 通过`return_stats()`查询内存流转统计：从OS申请字节数、归还OS字节数、分配给应用字节数、应用释放字节数、当前持有/使用量、效率比等。ASYNC模式下后台线程每30轮扫描自动输出`[RECLAIM-STATS]`日志。 |
 | CRTP零开销后端 | 后端通过CRTP静态分派，分配热路径无虚函数调用；可选ARMv8.1 LSE原子指令，编译期开关。 |
 | 崩溃恢复 | 可检测CAS、状态日志、缓存刷写三档可选机制，支持崩溃后扫描重建分配器状态。 |
 
@@ -143,7 +145,7 @@ cmake -B build -DUBALLOC_USE_UBSE=OFF && cmake --build build -j
 | `dynamic_discovery_example` | 演示`UBALLOC_HEAP_ID`驱动的动态成员发现 |
 | `distributed_example` | 演示多档位分配、`lookup_by_address`与cross-process remote free |
 | `stl_full_shm_example` | 演示`shm_new<T>(pub_tid{})`合并发布STL容器（header+data均在shm） |
-| `stl_data_only_example` | 演示STL容器data buffer在shm、header在本地的模式 |
+| `reclaim_example` | 演示异步内存归还（SYNC/ASYNC两种模式，LIVE→DETACHED→RETURNED全流程，purge立即归还） |
 | `uballoc_test` | 单元测试（`ctest`入口） |
 
 ## 使用方法
@@ -335,6 +337,13 @@ UBALLOC_HEAP_ID=myheap ./scripts/cleanup_shms_ub.sh     # 指定 heap_id
 | `UBALLOC_RECOVER_LOG` | 编译期状态日志开关（崩溃恢复） | `ON`（CMake） | `ON`/`OFF` |
 | `UBALLOC_RECOVER_FLUSH` | 编译期缓存刷写开关（崩溃恢复） | `OFF`（CMake） | `ON`/`OFF` |
 | `UBALLOC_LSE` | 编译期ARMv8.1 LSE原子指令开关 | `ON`（CMake） | `ON`/`OFF` |
+| `UBALLOC_RECLAIM_MODE` | 内存归还模式：`async`（默认）由后台线程自动归还，`sync`在malloc/free内联触发 | `async` | `async`/`sync` |
+| `UBALLOC_RECLAIM_ENABLED` | 内存归还总开关；设为0可完全关闭归还功能 | `1` | `0`/`1` |
+| `UBALLOC_RECLAIM_DECAY1_MS` | LIVE→DETACHED超时（毫秒）；段空闲后经过此时间才detach | `5000` | 任意非负整数 |
+| `UBALLOC_RECLAIM_DECAY2_MS` | DETACHED→RETURNED超时（毫秒）；段detach后经过此时间才delete归还OS | `60000` | 任意非负整数 |
+| `UBALLOC_RECLAIM_SCAN_INTERVAL_MS` | ASYNC模式后台线程定时扫描间隔（毫秒） | `5000` | 任意正整数 |
+| `UBALLOC_RECLAIM_STATS` | 内存统计开关；设为0关闭热路径字节计数（零开销） | `1` | `0`/`1` |
+| `UBALLOC_RECLAIM_LOG_STATS_INTERVAL` | ASYNC模式`[RECLAIM-STATS]`日志输出间隔（每N轮后台扫描输出一次） | `30` | 任意正整数 |
 
 ### 环境变量配置示例
 
@@ -785,6 +794,7 @@ uballoc::shm_delete(cfg);  // 再析构+释放
 - 需要按地址反查发布信息（`lookup_by_address`）；
 - 需要查询集群状态（`rank`/`total_processes`/`is_owner`/`is_initialized`）；
 - 需要完全重置分配器（`reset`）；
+- 需要立即归还空闲段给OS（`purge`）或查询内存统计（`return_stats`）；
 - uffd不可用时手动启用SIGSEGV fault handler作为回退（`enable_fault_handler`）。
 
 ### uballoc_memalign
@@ -950,10 +960,12 @@ bool uballoc::is_initialized();
 **函数定义**
 
 ```cpp
+// C++ API
 void uballoc::reset();
-```
 
-> **注**：仅C++ API。
+// C API
+void uballoc_reset(void);
+```
 
 ### uballoc_enable_fault_handler
 
@@ -1020,6 +1032,139 @@ bool uballoc_enable_userfaultfd(void);
 void uballoc::disable_userfaultfd();
 void uballoc_disable_userfaultfd(void);
 ```
+
+### uballoc_purge
+
+**函数功能**
+
+立即归还所有空闲段给操作系统，跳过decay1/decay2定时器。对LIVE且`live_slab_count==0`的段执行detach+delete一步到位，对DETACHED段执行delete。适用于应用主动释放大批内存后需要立即归还的场景（如批处理任务间歇期）。
+
+**函数定义**
+
+```cpp
+// C++ API
+void uballoc::purge();
+
+// C API
+void uballoc_purge(void);
+```
+
+**示例**
+
+```cpp
+// 分配并释放大批内存
+std::vector<void*> ptrs;
+for (int i = 0; i < 10000; ++i) ptrs.push_back(uballoc::malloc(1024));
+for (void* p : ptrs) uballoc::free(p);
+ptrs.clear();
+
+// 立即归还空闲段给OS，不等decay定时器
+uballoc::purge();
+```
+
+### uballoc_return_stats
+
+**函数功能**
+
+查询内存归还统计信息，包括段状态快照、累计转换计数、字节级内存流转统计等。
+
+**函数定义**
+
+```cpp
+// C++ API
+uballoc::ReturnStats uballoc::return_stats();
+
+// C API
+void uballoc_return_stats(uballoc_return_stats_t *out);
+```
+
+**参数说明（C API）**
+
+| 参数名 | 描述 | 取值范围 | 输入/输出 |
+|--------|------|---------|----------|
+| `out` | 输出参数，写入统计信息结构体 | 非空 | 输出 |
+
+**`ReturnStats`结构体定义（C++）**
+
+```cpp
+struct ReturnStats {
+    // 段级快照（当前时刻各状态段数）
+    size_t segments_live;        // LIVE段数（在用）
+    size_t segments_detached;    // DETACHED段数（待归还）
+    size_t segments_returned;    // RETURNED段数（已归还）
+
+    // 段级累计（累计转换次数）
+    size_t total_detached_count;   // 累计detach次数
+    size_t total_returned_count;   // 累计delete/return次数
+    size_t total_recreated_count;  // 累计重建次数
+
+    // 字节级累计统计（需求⑤）
+    uint64_t requested_from_os_bytes;   // 累计从OS申请的字节数
+    uint64_t returned_to_os_bytes;      // 累计归还OS的字节数
+    uint64_t allocated_to_app_bytes;    // 累计分配给应用的字节数
+    uint64_t freed_from_app_bytes;      // 累计应用释放的字节数
+    uint64_t thrash_events;             // 抖动事件数（LIVE→DETACHED→LIVE）
+};
+```
+
+**`uballoc_return_stats_t`结构体定义（C API）**
+
+```c
+typedef struct {
+    size_t segments_live;
+    size_t segments_detached;
+    size_t segments_returned;
+    size_t total_detached_count;
+    size_t total_returned_count;
+    size_t total_recreated_count;
+    uint64_t requested_from_os_bytes;
+    uint64_t returned_to_os_bytes;
+    uint64_t allocated_to_app_bytes;
+    uint64_t freed_from_app_bytes;
+    uint64_t thrash_events;
+} uballoc_return_stats_t;
+```
+
+**计算字段**
+
+| 指标 | 公式 | 含义 |
+|------|------|------|
+| 当前持有 | `requested_from_os_bytes - returned_to_os_bytes` | uballoc从OS持有的内存 |
+| 应用在用 | `allocated_to_app_bytes - freed_from_app_bytes` | 应用当前占用的内存 |
+| 效率比 | `应用在用 / 当前持有` | 高=紧凑，低=囤积 |
+
+**示例（C++）**
+
+```cpp
+auto stats = uballoc::return_stats();
+uint64_t held = stats.requested_from_os_bytes - stats.returned_to_os_bytes;
+uint64_t in_use = stats.allocated_to_app_bytes - stats.freed_from_app_bytes;
+double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
+
+std::cout << "held=" << held / (1024*1024) << "MB"
+          << " in_use=" << in_use / (1024*1024) << "MB"
+          << " efficiency=" << efficiency << "%"
+          << " live=" << stats.segments_live
+          << " detached=" << stats.segments_detached
+          << " returned=" << stats.segments_returned
+          << std::endl;
+```
+
+**示例（C）**
+
+```c
+uballoc_return_stats_t s;
+uballoc_return_stats(&s);
+uint64_t held = s.requested_from_os_bytes - s.returned_to_os_bytes;
+uint64_t in_use = s.allocated_to_app_bytes - s.freed_from_app_bytes;
+double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
+
+printf("held=%luMB in_use=%luMB efficiency=%.1f%% live=%lu detached=%lu returned=%lu\n",
+       held / (1024*1024), in_use / (1024*1024), efficiency,
+       s.segments_live, s.segments_detached, s.segments_returned);
+```
+
+> **注**：通过`UBALLOC_RECLAIM_STATS=0`可关闭字节级统计（热路径零开销）。
 
 ---
 
@@ -1215,6 +1360,24 @@ local
 ---
 
 以上结果仅供参考，以实际运行结果为准。
+
+---
+
+## 内存归还相关常见问题
+
+### SYNC模式和ASYNC模式有什么区别？
+
+| | SYNC模式 | ASYNC模式（默认） |
+|---|---|---|
+| 触发方式 | malloc/free内联调`check_one_segment_for_reclaim` | 后台线程定时扫描`scan_all_segments` |
+| 热路径开销 | 每次malloc/free做一次段扫描 | 仅在段变空时调`trigger_now()`（纳秒级） |
+| 空闲期归还 | 不归还（无malloc/free事件则不触发） | 归还（后台线程自主扫描） |
+| 后台线程 | 无 | 每进程一个（fork子进程自动跳过） |
+| 适用场景 | 简单场景、持续高吞吐 | 生产环境、活动低谷期 |
+
+### fork子进程会启动后台回收线程吗？
+
+不会。fork子进程的`init()`检测到PID变化后跳过ReclaimThread创建。fork子进程通常短命（分配+释放后`_exit`），不需要后台回收。如果fork子进程需要回收，可通过SYNC模式或`purge()`触发。
 
 ---
 

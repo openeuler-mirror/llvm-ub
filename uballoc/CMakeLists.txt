@@ -104,6 +104,9 @@ if(UBALLOC_BUILD_EXAMPLES)
     add_executable(uffd_example example/uffd_example.cpp)
     target_link_libraries(uffd_example PRIVATE uballoc rt pthread)
 
+    add_executable(reclaim_example example/reclaim_example.cpp)
+    target_link_libraries(reclaim_example PRIVATE uballoc rt pthread)
+
 endif()
 
 install(TARGETS uballoc

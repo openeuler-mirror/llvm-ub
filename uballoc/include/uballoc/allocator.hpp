@@ -112,13 +112,22 @@ struct Allocator {
             return allocate_large(size);
         }
 
-        auto peek_result = small.peek(thread_id, *class_);
-        if (!peek_result) return nullptr;
+        // Reclaim race retry: pop() returns nullptr when the (idx, block)
+        // peeked earlier was invalidated by segment reclaim between the
+        // two calls (possible if this thread was preempted). Retry with a
+        // fresh peek. Bounded to avoid pathological live-lock.
+        for (int retry = 0; retry < 64; ++retry) {
+            auto peek_result = small.peek(thread_id, *class_);
+            if (!peek_result) return nullptr;
 
-        auto [idx, block] = *peek_result;
-        void* ptr = small.pop(thread_id, *class_, idx, block);
-        if (owned) owned->state.clear();
-        return ptr;
+            auto [idx, block] = *peek_result;
+            void* ptr = small.pop(thread_id, *class_, idx, block);
+            if (ptr) {
+                if (owned) owned->state.clear();
+                return ptr;
+            }
+        }
+        return nullptr;
     }
 
     void* allocate_large(size_t size) {
@@ -127,11 +136,16 @@ struct Allocator {
             return allocate_huge(size);
         }
 
-        auto peek_result = large.peek(thread_id, *class_);
-        if (!peek_result) return nullptr;
+        // Reclaim race retry (same as allocate() for Small).
+        for (int retry = 0; retry < 64; ++retry) {
+            auto peek_result = large.peek(thread_id, *class_);
+            if (!peek_result) return nullptr;
 
-        auto [idx, block] = *peek_result;
-        return large.pop(thread_id, *class_, idx, block);
+            auto [idx, block] = *peek_result;
+            void* ptr = large.pop(thread_id, *class_, idx, block);
+            if (ptr) return ptr;
+        }
+        return nullptr;
     }
 
     void* allocate_huge(size_t size) {

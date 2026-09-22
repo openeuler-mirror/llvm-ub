@@ -23,6 +23,7 @@ add_executable(published_example           published_example.cpp)
 add_executable(dynamic_discovery_example   dynamic_discovery_example.cpp)
 add_executable(fault_handler_example       fault_handler_example.cpp)
 add_executable(uffd_example                 uffd_example.cpp)
+add_executable(reclaim_example             reclaim_example.cpp)
 
 foreach(exe
     distributed_example
@@ -33,6 +34,7 @@ foreach(exe
     dynamic_discovery_example
     fault_handler_example
     uffd_example
+    reclaim_example
 )
     target_link_libraries(${exe} PRIVATE uballoc::uballoc)
     set_target_properties(${exe} PROPERTIES
