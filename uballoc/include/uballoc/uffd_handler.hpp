@@ -679,6 +679,18 @@ void uffd_handler_thread() {
         std::memcpy(seg_name, dir->descs[fi.s].name, 64);
         size_t seg_size = dir->descs[fi.s].total_size;
 
+        // verify CRC after ready==1.
+        uint32_t stored_crc = dir->descs[fi.s].crc32;
+        uint32_t actual_crc = dir->descs[fi.s].compute_checksum();
+        if (stored_crc != actual_crc) {
+            LOG_ERROR("uffd handler: P" << fi.k << " seg=" << fi.s
+                     << " CRC mismatch (stored=0x" << std::hex << stored_crc
+                     << " actual=0x" << actual_crc << std::dec
+                     << ") — poisoning fault address");
+            uffd_poison(fault_addr, "seg_crc_mismatch");
+            continue;
+        }
+
         if (seg_name[0] == '\0' || seg_size == 0) {
             uffd_poison(fault_addr, "seg_name_or_size_zero");
             continue;

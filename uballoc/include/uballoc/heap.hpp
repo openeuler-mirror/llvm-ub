@@ -103,9 +103,10 @@ struct HeapShared {
     }
 
     std::optional<SlabIndex<B>> pop(ThreadId id, Slab<B>& slabs,
-                                     bool allow_cross_process = true) {
+                                     bool allow_cross_process = true,
+                                     DistributedHelpArray* help = nullptr) {
         if (!free.is_empty(id)) {
-            return free.pop(id, slabs);
+            return free.pop(id, slabs, help);
         }
 
         if (!allow_cross_process) return std::nullopt;
@@ -113,7 +114,7 @@ struct HeapShared {
         for (int j = 0; j < total_processes_; ++j) {
             if (j == rank_ || !cross_free_ptrs_[j]) continue;
             if (!cross_free_ptrs_[j]->is_empty(id)) {
-                auto result = cross_free_ptrs_[j]->pop(id, slabs);
+                auto result = cross_free_ptrs_[j]->pop(id, slabs, help);
                 if (result) return result;
             }
         }
@@ -121,8 +122,9 @@ struct HeapShared {
         return std::nullopt;
     }
 
-    void push(ThreadId id, Slab<B>& slabs, SlabIndex<B> head, SlabIndex<B> tail) {
-        free.push(id, slabs, head, tail);
+    void push(ThreadId id, Slab<B>& slabs, SlabIndex<B> head, SlabIndex<B> tail,
+              DistributedHelpArray* help = nullptr) {
+        free.push(id, slabs, head, tail, help);
     }
 
     struct BumpRange {
@@ -229,11 +231,23 @@ struct HeapOwned {
         return true;
     }
 
-    bool unsized_to_sized(ThreadId id, [[maybe_unused]] RecoverState& state, Slab<B>& slabs, B class_) {
+    bool unsized_to_sized(ThreadId id, RecoverState& state, Slab<B>& slabs, B class_) {
         auto idx = unsized.peek();
         if (!idx) return false;
 
         LOG_INFO("Transfer: " << idx->get() << " from unsized to sized (" << class_.size() << ")");
+
+        // Record state before risky operations.
+        // disc 0 = UnsizedToSized, data = idx(32) | class_index(8)<<32
+#ifdef UBALLOC_RECOVER_CAS
+        if constexpr (std::is_same_v<B, Small>) {
+            state.store_small(0x10, idx->internal() |
+                           (static_cast<uint64_t>(class_.index()) << 32));
+        } else if constexpr (std::is_same_v<B, Large>) {
+            state.store_large(0x10, idx->internal() |
+                           (static_cast<uint64_t>(class_.index()) << 32));
+        }
+#endif
 
         SlabLocal<B>& local = slabs.local(*idx);
 
@@ -251,6 +265,9 @@ struct HeapOwned {
 
         unsized.set((unsized_next > 0) ? std::optional<SlabIndex<B>>(SlabIndex<B>::unpack(unsized_next)) : std::nullopt, unsized.len() - 1);
 
+#ifdef UBALLOC_RECOVER_CAS
+        state.clear();
+#endif
         return true;
     }
 
@@ -285,19 +302,28 @@ struct Heap {
     Slab<B>* slabs;
     Data<B>* data;
     std::unique_ptr<stat::thread::Recorder<B>> stat_recorder;
+    // Help array pointer for detectable CAS.
+    // Set during init_distributed via set_help(). Null in non-distributed
+    // or pre-init Heap. Used by push/pop/free_remote to call update()
+    // which feeds the HelpArray (observer recording) and bumps version.
+    DistributedHelpArray* help_;
 
     Heap() : shared(nullptr), owned(nullptr), slabs(nullptr), data(nullptr),
-             stat_recorder(std::make_unique<stat::thread::Recorder<B>>()) {}
+             stat_recorder(std::make_unique<stat::thread::Recorder<B>>()),
+             help_(nullptr) {}
     Heap(HeapShared<B>* sh, HeapOwned<B>* ow, Slab<B>* sl, Data<B>* dt)
         : shared(sh), owned(ow), slabs(sl), data(dt),
-          stat_recorder(std::make_unique<stat::thread::Recorder<B>>()) {}
+          stat_recorder(std::make_unique<stat::thread::Recorder<B>>()),
+          help_(nullptr) {}
     Heap(Heap&& other) noexcept
         : shared(other.shared), owned(other.owned), slabs(other.slabs),
-          data(other.data), stat_recorder(std::move(other.stat_recorder)) {
+          data(other.data), stat_recorder(std::move(other.stat_recorder)),
+          help_(other.help_) {
         other.shared = nullptr;
         other.owned = nullptr;
         other.slabs = nullptr;
         other.data = nullptr;
+        other.help_ = nullptr;
     }
     Heap& operator=(Heap&& other) noexcept {
         shared = other.shared;
@@ -305,12 +331,28 @@ struct Heap {
         slabs = other.slabs;
         data = other.data;
         stat_recorder = std::move(other.stat_recorder);
+        help_ = other.help_;
         other.shared = nullptr;
         other.owned = nullptr;
         other.slabs = nullptr;
         other.data = nullptr;
+        other.help_ = nullptr;
         return *this;
     }
+
+    void set_help(DistributedHelpArray* h) { help_ = h; }
+
+#ifdef UBALLOC_RECOVER_CAS
+    // Dispatch to store_small or store_large based on bracket type B.
+    // Small uses discriminant 0x10 series, Large uses 0x20 series.
+    void store_state(RecoverState& state, uint8_t disc, uint64_t data) {
+        if constexpr (std::is_same_v<B, Small>) {
+            state.store_small(disc, data);
+        } else if constexpr (std::is_same_v<B, Large>) {
+            state.store_large(disc, data);
+        }
+    }
+#endif
 
     std::optional<Offset<B>> checked_pointer_to_offset(void* ptr) {
         return data->checked_pointer_to_offset(ptr);
@@ -345,6 +387,13 @@ struct Heap {
         }
 
         assert((local.free.dense[block.row] & (1ULL << block.col)) != 0);
+
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 5 = SizedToApplication
+        // data = idx(32) | Bit::pack(block)(12)<<32
+        store_state(owned->state, 0x15, idx.internal() |
+            (Bit::pack(block) << 32));
+#endif
 
         size_t count_before = local.free.len();
         local.free.unset(block);
@@ -416,11 +465,28 @@ struct Heap {
         bool reuse_first = (affinity_mode().load(std::memory_order_acquire) ==
                             static_cast<size_t>(AffinityMode::ReuseFirst));
 
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 1 = GlobalToUnsized — store after pop succeeds so we
+        // have the actual slab index. Version comes from help array.
+        // (Stored before the risky steal/push steps that follow.)
+#endif
+
         auto global_idx = shared->pop(id, *slabs,
-                                      /*allow_cross_process=*/reuse_first);
+                                      /*allow_cross_process=*/reuse_first,
+                                      help_);
         if (global_idx) {
             stat_recorder->record(id, stat::thread::EventType::GlobalToUnsized);
             LOG_INFO("Transfer: " << global_idx->get() << " from global to unsized");
+
+#ifdef UBALLOC_RECOVER_CAS
+            {
+                Version ver = Version();
+                if (help_) ver = help_->load(id, id);
+                store_state(owned->state, 0x11,
+                    global_idx->internal() |
+                    (static_cast<uint64_t>(ver.value_) << 32));
+            }
+#endif
 
             slabs->local(*global_idx).steal(id);
             owned->unsized.push(*slabs, *global_idx);
@@ -440,7 +506,8 @@ struct Heap {
 
             if (!range && !reuse_first) {
                 global_idx = shared->pop(id, *slabs,
-                                         /*allow_cross_process=*/true);
+                                         /*allow_cross_process=*/true,
+                                         help_);
                 if (global_idx) {
                     stat_recorder->record(id, stat::thread::EventType::GlobalToUnsized);
                     LOG_INFO("Transfer: " << global_idx->get()
@@ -457,10 +524,25 @@ struct Heap {
                 stat_recorder->record(id, stat::thread::EventType::Bump);
                 LOG_INFO("Transfer: " << range->start.get() << ".." << range->end.get() << " from bump to unsized");
 
+#ifdef UBALLOC_RECOVER_CAS
+                // disc 2 = BumpToUnsized — store start index + version
+                {
+                    Version ver = Version();
+                    if (help_) ver = help_->load(id, id);
+                    store_state(owned->state, 0x12,
+                        range->start.internal() |
+                        (static_cast<uint64_t>(ver.value_) << 32));
+                }
+#endif
+
                 uint32_t batch = batch_bump_pop().load(std::memory_order_relaxed);
                 slabs->link(id, range->start, range->end, std::nullopt);
                 owned->unsized.set(range->start, batch);
             }
+
+#ifdef UBALLOC_RECOVER_CAS
+            owned->state.clear();  // GlobalToUnsized / BumpToUnsized complete
+#endif
         }
 
         owned->unsized_to_sized(id, owned->state, *slabs, class_);
@@ -471,6 +553,17 @@ struct Heap {
 
     void detach(ThreadId id, B class_, SlabIndex<B> idx) {
         stat_recorder->record(id, stat::thread::EventType::Detach, 0, class_);
+
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 8 = Detach, data = idx(32) | ver(16)<<32
+        {
+            Version ver = Version();
+            if (help_) ver = help_->load(id, id);
+            store_state(owned->state, 0x18,
+                idx.internal() |
+                (static_cast<uint64_t>(ver.value_) << 32));
+        }
+#endif
 
         auto& remote = slabs->remote(idx);
         uint64_t remote_raw = remote.raw_.load(std::memory_order_relaxed);
@@ -546,6 +639,14 @@ struct Heap {
         }
 
         SlabLocal<B>& local = slabs->local(idx);
+
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 6 = ApplicationToSized
+        // data = idx(32) | Bit::pack(block)(12)<<32
+        store_state(owned->state, 0x16, idx.internal() |
+            (Bit::pack(block) << 32));
+#endif
+
         local.free.set(block);
         size_t count = local.free.len();
 
@@ -588,21 +689,53 @@ struct Heap {
 
         auto& remote = slabs->remote(idx);
 
+        // Bump version via help array so detect() can distinguish between
+        // specific remote-free operations.
+        Version ver = Version();
+        if (help_) {
+            Version current = help_->load(id, id);
+            ver = current.next();
+            help_->store(id, id, ver);
+        }
+
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 7 = Remote, data = idx(32) | ver(16)<<32 | last(1)<<48
+        // last is initially 0, updated after CAS if this was the last free
+        store_state(owned->state, 0x17,
+            idx.internal() |
+            (static_cast<uint64_t>(ver.value_) << 32));
+#endif
+
         bool done = false;
         bool reclaimed = false;
         while (!done) {
             uint64_t remote_raw = remote.raw_.load(std::memory_order_acquire);
             auto meta = CasState<Remote>::unpack(remote_raw);
 
+            // do_help: record observation for recovery
+            if (help_ && meta.id) {
+                help_->store(id, *meta.id, meta.version);
+            }
+
             if (meta.inner.free > 0) {
                 Remote new_meta{static_cast<uint16_t>(meta.inner.free - 1)};
-                uint64_t new_raw = CasState<Remote>::pack(CasState<Remote>{std::optional<ThreadId>(id), Version(), new_meta});
+                uint64_t new_raw = CasState<Remote>::pack(
+                    CasState<Remote>{std::optional<ThreadId>(id), ver, new_meta});
 
                 if (remote.raw_.compare_exchange_weak(remote_raw, new_raw,
                         std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                    flush(&remote.raw_, Invalidate::No);
+                    fence();
                     done = true;
                     if (new_meta.free == 0) {
                         reclaimed = true;
+#ifdef UBALLOC_RECOVER_CAS
+                        // Update last flag in stored state
+                        store_state(owned->state, 0x17,
+                            idx.internal() |
+                            (static_cast<uint64_t>(ver.value_) << 32) |
+                            (1ULL << 48));
+#endif
                     }
                 }
             } else {
@@ -613,7 +746,7 @@ struct Heap {
         if (reclaimed) {
             LOG_INFO("Reclaim: slab " << idx.get() << " fully freed remotely");
             slabs->local(idx).free.fill(class_.count());
-            shared->push(id, *slabs, idx, idx);
+            shared->push(id, *slabs, idx, idx, help_);
 
             SegmentHeader* hdr = slab_segment_header(*slabs, idx);
             if (hdr) {
@@ -655,11 +788,38 @@ struct Heap {
 
         LOG_INFO("Transfer: " << head.get() << "..=" << tail.get() << " from unsized to global");
 
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 3 = UnsizedToGlobalSave — store head index (matches
+        // what unsized.peek() returns, so recovery handler can compare)
+        store_state(owned->state, 0x13, head.internal());
+#endif
+
         uint32_t next = slabs->local(tail).next.load(std::memory_order_relaxed);
         owned->unsized.set((next > 0) ? std::optional<SlabIndex<B>>(SlabIndex<B>::unpack(next)) : std::nullopt,
                           count - batch);
 
-        shared->push(id, *slabs, head, tail);
+#ifdef UBALLOC_RECOVER_CAS
+        // disc 4 = UnsizedToGlobal — store head index + version.
+        // Must store the NEXT version (V+1), matching the version
+        // SlabStackGlobal::push will CAS with. push calls
+        // help->load(id,id).next() internally, so we do the same here.
+        {
+            Version ver = Version();
+            if (help_) {
+                Version current = help_->load(id, id);
+                ver = current.next();
+            }
+            store_state(owned->state, 0x14,
+                head.internal() |
+                (static_cast<uint64_t>(ver.value_) << 32));
+        }
+#endif
+
+        shared->push(id, *slabs, head, tail, help_);
+
+#ifdef UBALLOC_RECOVER_CAS
+        owned->state.clear();
+#endif
     }
 
     std::vector<stat::Report> report(ThreadId id) {

@@ -31,6 +31,7 @@ uballoc是专为aarch64架构、Linux操作系统下多进程多节点分布式�
 | 碎片整理 | `uballoc::usable_size(ptr)`返回分配的可用大小（可用于right-sizing避免不必要realloc）；`uballoc::defrag_hints(threshold)`返回低占用率内存区域中的活跃分配列表，应用执行malloc+memcpy+fixrefs+free完成协作式碎片整理。 |
 | CRTP零开销后端 | 后端通过CRTP静态分派，分配热路径无虚函数调用；可选ARMv8.1 LSE原子指令，编译期开关。 |
 | 崩溃恢复 | 可检测CAS、状态日志、缓存刷写三档可选机制，支持崩溃后扫描重建分配器状态。 |
+| 死节点心跳检测 | 每进程由独立后台线程周期递增心跳计数器至 bootstrap 槽位（默认间隔 5s）。peer 的计数器停止推进超过 `UBALLOC_DEAD_PEER_TIMEOUT_MS`（默认 30s）时，判定为死亡：自动强制释放其借用段，`wait_for_unreferenced` 不再永久挂起。可通过 `UBALLOC_HEARTBEAT_ENABLED=0` 关闭。详见[死节点心跳检测](#死节点心跳检测)。 |
 
 ## 安装部署
 
@@ -346,6 +347,12 @@ UBALLOC_HEAP_ID=myheap ./scripts/cleanup_shms_ub.sh     # 指定 heap_id
 | `UBALLOC_RECLAIM_SCAN_INTERVAL_MS` | ASYNC模式后台线程定时扫描间隔（毫秒） | `5000` | 任意正整数 |
 | `UBALLOC_RECLAIM_STATS` | 内存统计开关；设为0关闭热路径字节计数（零开销） | `1` | `0`/`1` |
 | `UBALLOC_RECLAIM_LOG_STATS_INTERVAL` | ASYNC模式`[RECLAIM-STATS]`日志输出间隔（每N轮后台扫描输出一次） | `30` | 任意正整数 |
+| `UBALLOC_HEARTBEAT_ENABLED` | 心跳功能总开关；设为 `0` 关闭心跳写入和死节点检测（peer 检测回退至 `kill(pid,0)` 检查） | `1` | `0`/`1` |
+| `UBALLOC_HEARTBEAT_INTERVAL_MS` | 心跳计数器递增间隔（毫秒）。每进程由独立后台线程按此间隔递增 bootstrap 槽位中的心跳计数器，供 peer 检测存活状态。必须小于 `UBALLOC_DEAD_PEER_TIMEOUT_MS`，否则自动调整为 2× 间隔。 | `5000` | 任意正整数 |
+| `UBALLOC_DEAD_PEER_TIMEOUT_MS` | peer 死亡判定阈值（毫秒）。peer 的心跳计数器停止推进超过此时间后，判定该 peer 已死亡，自动强制释放其借用段，`wait_for_unreferenced` 也在所有 peer 死亡后继续推进。必须大于 `UBALLOC_HEARTBEAT_INTERVAL_MS`。 | `30000` | 任意正整数 |
+| `UBALLOC_WAIT_UNREFERENCED_TIMEOUT_MS` | `wait_for_unreferenced` 硬超时（毫秒），独立于心跳检测。`0`（默认）表示不设硬超时，仅依赖心跳检测解阻塞。设为正数时，无论 peer 心跳状态如何，超时后强制继续推进，作为心跳检测的后备保险。 | `0` | 任意非负整数 |
+
+> **CRC 校验超时**：P1 等待 P0 metadata 时，先等待 `ready_flag`（最长 30 秒），再验证 CRC（最长 30 秒重试）。若任一阶段超时，P1 放弃初始化（`init()` 返回失败）。原行为是永久等待。
 
 ### 环境变量配置示例
 
@@ -1401,14 +1408,15 @@ cfg->ready.store(2, std::memory_order_release);  // 通知发布方
 
 - `publish()` / `lookup_by_type_blocking()` — 数据发现与同步
 - 发布方进入cleanup后，消费方仍可发现其数据（bootstrap slot在`wait_for_unreferenced`期间保持`ready=1`）
-- `wait_for_unreferenced()` 无限等待其他节点释放borrow——所有进程正常退出时，shms自动清理，无残留
+- `wait_for_unreferenced()` 在所有 peer 心跳停止推进或硬超时后继续推进，不再永久挂起；正常退出场景下 shms 仍自动清理无残留
+- 死 peer 检测：自动强制释放死亡 peer 的借用段（munmap + close fd + 标记 DETACHED）
 - `check_remote_segments()` — 显式（非懒加载）attach远端段（线程安全，多线程并发调用不会重复attach）
 
 ### 库无法提供的能力
 
 - 知道其他进程何时"完成访问"你的数据（需要应用层协调）
 - 阻止进程退出时的跨节点映射失效（UBSE设备行为）
-- 远端进程崩溃后自动恢复——本地进程会无限等待（挂起），需要手动kill + 清理脚本清理残留shms
+- 跨节点 borrower 崩溃后物理内存的自动回收——本地 `wait_for_unreferenced` 可在心跳检测后解阻塞并 unlink 名称，但物理内存需 UBSE daemon GC 或 `cleanup_shms_ub.sh` 脚本回收
 
 ### 清理残留共享内存
 
@@ -1480,6 +1488,22 @@ local
 ### fork子进程会启动后台回收线程吗？
 
 不会。fork子进程的`init()`检测到PID变化后跳过ReclaimThread创建。fork子进程通常短命（分配+释放后`_exit`），不需要后台回收。如果fork子进程需要回收，可通过SYNC模式或`purge()`触发。
+
+---
+
+## 死节点心跳检测
+
+### 功能说明
+
+当远端进程崩溃而未正常释放共享内存借用时，本地进程的 `wait_for_unreferenced()` 会永久挂起。死节点心跳检测机制将此"永久挂起"转化为"有限时间内自动解阻塞"。
+
+每进程周期性递增 bootstrap 槽位中的心跳计数器。其他进程通过观察该计数器是否停止推进来判断 peer 是否存活——若计数器在 `UBALLOC_DEAD_PEER_TIMEOUT_MS` 时间内未递增，则判定该 peer 已死亡，自动强制释放其借用段，`wait_for_unreferenced` 也不再永久挂起。
+
+> **注意**：心跳使用计数器而非时间戳，因为不同节点的 `CLOCK_MONOTONIC` 时钟基准不同，跨节点比较时间戳会导致误判。计数器方案中，reader 用自己的本地时钟测量"计数器多久没变了"，不跨节点比较时间。
+
+> **残留场景**：`wait_for_unreferenced` 的心跳解阻塞仅在所有 peer 均死亡/静默时生效。若集群中存在另一个常驻存活进程（心跳正常），即使残留引用实际来自已崩溃的跨节点 borrower，`wait_for_unreferenced` 仍会因该存活进程而继续等待。此场景下需配置 `UBALLOC_WAIT_UNREFERENCED_TIMEOUT_MS` 设硬超时兜底，或依赖 UBSE daemon 的 import lease 过期机制回收。
+
+> **进程暂停风险**：进程被 `SIGSTOP` 暂停（如调试器 attach、`Ctrl+Z`）时心跳线程也暂停，可能被误判死亡，导致其借用段被强制回收。生产环境应避免对 uballoc 进程使用 `SIGSTOP`。
 
 ---
 

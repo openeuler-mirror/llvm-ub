@@ -55,6 +55,21 @@ struct BootstrapSlot {
     std::atomic<uint32_t>  ready;       // 1 when this slot's metadata shm is initialized
     std::atomic<uint32_t>  node_slot_id; // NEW (multi-proc/node): UBSE slot_id of this rank's node (0 = unset)
     std::atomic<uint32_t>  node_index;   // NEW (multi-proc/node): logical 0..MAX_PROCESSES-1, UINT32_MAX = unassigned
+
+    // Monotonic heartbeat counter, incremented by the live owner process every
+	// heartbeat_interval_ms. Readers track the last-seen counter value locally
+	// and measure elapsed time with their OWN clock — if the counter hasn't
+	// advanced within dead_peer_timeout, the peer is treated as dead.
+    //
+    // IMPORTANT: this is a COUNTER, not a timestamp. A counter is used
+    // (not a steady_clock timestamp) because CLOCK_MONOTONIC epochs are
+    // machine-local — two nodes with different uptimes produce
+    // incomparable timestamps, causing live cross-node peers to be
+    // misdetected as dead. A counter is globally comparable: "stopped
+    // advancing" means the same thing on every node. The staleness
+    // check uses the READER's local clock to measure how long the
+    // counter has been stagnant, never comparing timestamps across nodes.
+    std::atomic<uint64_t>  heartbeat_seq;
 };
 
 struct BootstrapBlock {

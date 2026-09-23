@@ -97,6 +97,10 @@ struct Allocator {
         }
         if (distributed_shared) {
             context = AllocatorContext(id, owned, &distributed_shared->help);
+            // Wire help array to Heap<B> so push/pop/free_remote can call
+			// update() with do_help.
+            small.set_help(context.get_distributed_help());
+            large.set_help(context.get_distributed_help());
         }
     }
 
