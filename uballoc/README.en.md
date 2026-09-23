@@ -7,15 +7,17 @@ C++17 shared memory allocator for multi-process, multi-node deployments on ARMv8
 ## Features
 
 - **Three size brackets** (4-per-doubling class granularity):
-  - Small: 8 B – 16 KB, 32 KB slabs (37 classes, 7/16 ratio)
-  - Large: 20 KB – 4 MB, 2 MB slabs (32 classes, 5/16 ratio)
-  - Huge: > 4 MB, 4 MB slots (buddy allocator)
+  - Small: 8 B – 16 KB, 32 KB slabs (37 classes, 4-per-doubling)
+  - Large: 16 KB – 2 MB, 4 MB slabs (28 classes, 4-per-doubling)
+  - Huge: > 2 MB, 2 MB slots (allocated by slot count)
+- **Ladder segment growth**: Small/Large segments grow in 4MB→16MB→64MB→128MB steps; first allocation uses only 4MB (not a full 128MB segment)
 - **Distributed shared memory**: fixed-VA mmap, cross-process alloc/free,
   cross-node publish/lookup
 - **Multi-process per node**: per-node refcounting, `claim_rank` dead-slot
   detection, `node_index` CAS assignment
 - **Freed memory return**: idle segments transition LIVE→DETACHED→RETURNED
   and are returned to the UBSE pool for cross-node reuse
+- **Introspection & defrag**: `return_stats` provides per-slab occupancy, Huge slot stats, empty-segment detection; `defrag_hints` returns live allocations in low-occupancy slabs for app-cooperative defragmentation
 - **Lazy attach**: userfaultfd-based on-demand segment attachment for remote
   data
 - **CRTP backends**: no virtual calls in the allocation path

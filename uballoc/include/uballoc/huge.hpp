@@ -17,6 +17,7 @@
 #include "cache.hpp"
 #include "log.hpp"
 #include "shm_provider.hpp"
+#include "segment.hpp"
 
 namespace uballoc {
 
@@ -188,6 +189,8 @@ struct Huge {
         size_t max_slots = shared_layout.slots_count > 0
             ? shared_layout.slots_count : MAX_SLOTS;
         uint32_t seg_count = sh->segment_count_.load(std::memory_order_acquire);
+        // Huge keeps uniform 128MB segments (no ladder), so
+        // seg_count * HUGE_SLOTS_PER_SEGMENT is correct.
         size_t seg_active = static_cast<size_t>(seg_count) * HUGE_SLOTS_PER_SEGMENT;
         return std::min(max_slots, seg_active);
     }
@@ -251,8 +254,8 @@ struct Huge {
     }
 
     void* allocate(ThreadId id, size_t size, HugeDescriptor& out) {
-        // FRAGMENTATION: slot_count = ceil(size / 4MB) rounds up to the
-        // nearest 4MB. For 5MB this means 2 slots = 8MB (37.5% waste).
+        // FRAGMENTATION: slot_count = ceil(size / 2MB) rounds up to the
+        // nearest 2MB. For 5MB this means 3 slots = 6MB (20% waste).
         // See HugeSize::SLAB_SIZE comment for the recommended 2MB-slot
         // optimization and trade-offs.
         size_t slot_count = (size + HugeSize::SLAB_SIZE - 1) / HugeSize::SLAB_SIZE;

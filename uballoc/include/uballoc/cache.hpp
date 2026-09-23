@@ -14,7 +14,8 @@ constexpr size_t SIZE_PAGE = 4096;
 
 constexpr size_t SEGMENT_VA_SIZE = 128ULL * 1024 * 1024;
 constexpr size_t MAX_SEGMENTS = 8192;
-constexpr size_t HUGE_SLOTS_PER_SEGMENT = SEGMENT_VA_SIZE / (4 * 1024 * 1024);
+constexpr size_t HUGE_SLAB_SIZE = 2 * 1024 * 1024;
+constexpr size_t HUGE_SLOTS_PER_SEGMENT = SEGMENT_VA_SIZE / HUGE_SLAB_SIZE;
 constexpr size_t MAX_HUGE_SLOTS = MAX_SEGMENTS * HUGE_SLOTS_PER_SEGMENT;
 
 using GrowFn = bool(*)();
@@ -83,6 +84,7 @@ struct ReturnStats {
     uint64_t returned_to_os_bytes = 0;
     uint64_t allocated_to_app_bytes = 0;
     uint64_t freed_from_app_bytes = 0;
+    double fragmentation_ratio = 0.0;
 };
 
 // Global atomic counters for hot-path byte tracking.

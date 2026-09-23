@@ -103,6 +103,9 @@ struct SlabSlice {
 };
 
 template<typename B>
+struct Slab;  // forward declaration
+
+template<typename B>
 struct Data {
     Page* base_;
     Page* region_start_;
@@ -111,20 +114,21 @@ struct Data {
     size_t segment_va_size_;
     size_t slabs_per_segment_;
     size_t data_offset_;
+    Slab<B>* slabs_;
     
     Data() : base_(nullptr), region_start_(nullptr), slab_count_(0), slab_capacity_(0),
-             segment_va_size_(0), slabs_per_segment_(0), data_offset_(0) {}
+             segment_va_size_(0), slabs_per_segment_(0), data_offset_(0), slabs_(nullptr) {}
     
     Data(Page* b, size_t count, size_t capacity)
         : base_(b - B::SLAB_SIZE / sizeof(Page)), region_start_(b), slab_count_(count),
           slab_capacity_(capacity),
           segment_va_size_(capacity > 0 ? capacity * B::SLAB_SIZE : 0),
           slabs_per_segment_(capacity),
-          data_offset_(0) {}
+          data_offset_(0), slabs_(nullptr) {}
     
     explicit Data(Page* b)
         : base_(b - B::SLAB_SIZE / sizeof(Page)), region_start_(b), slab_count_(0),
-          slab_capacity_(0), segment_va_size_(0), slabs_per_segment_(0), data_offset_(0) {}
+          slab_capacity_(0), segment_va_size_(0), slabs_per_segment_(0), data_offset_(0), slabs_(nullptr) {}
 
     void init_segmented(Page* data_start, size_t count, size_t capacity,
                         size_t seg_va_size, size_t slabs_per_seg, size_t data_off) {
@@ -137,10 +141,25 @@ struct Data {
         slabs_per_segment_ = slabs_per_seg;
         data_offset_ = data_off;
     }
+
+    void set_slabs(Slab<B>* s) { slabs_ = s; }
     
     Offset<B> from_block(B class_, SlabIndex<B> slab, Bit block) const {
-        uint32_t seg = slab.get() / slabs_per_segment_;
-        uint32_t seg_local = slab.get() % slabs_per_segment_;
+        uint32_t seg, seg_local;
+        if (slabs_) {
+            int pid = slabs_->find_process(slab.get());
+            size_t local_idx = slab.get() - slabs_->cumulative[pid];
+            auto loc = slabs_->find_segment(pid, local_idx);
+            // per-process seg → global seg (pid * MAX_SEGMENTS + seg_in_pid)
+            seg = static_cast<uint32_t>(pid) * static_cast<uint32_t>(MAX_SEGMENTS)
+                + static_cast<uint32_t>(loc.seg);
+            seg_local = static_cast<uint32_t>(loc.seg_local);
+        } else {
+            seg = (slabs_per_segment_ > 0)
+                ? slab.get() / slabs_per_segment_ : 0;
+            seg_local = (slabs_per_segment_ > 0)
+                ? slab.get() % slabs_per_segment_ : static_cast<uint32_t>(slab.get());
+        }
         uint64_t offset = static_cast<uint64_t>(seg) * segment_va_size_
                         + data_offset_
                         + static_cast<uint64_t>(seg_local) * B::SLAB_SIZE
@@ -156,6 +175,13 @@ struct Data {
             ? raw % segment_va_size_ : raw;
         uint64_t adjusted = (within >= data_offset_) ? (within - data_offset_) : 0;
         uint32_t seg_local = static_cast<uint32_t>(adjusted / B::SLAB_SIZE);
+        if (slabs_ && slabs_per_segment_ > 0) {
+            size_t pid = seg / MAX_SEGMENTS;
+            size_t seg_in_pid = seg % MAX_SEGMENTS;
+            size_t global_start = slabs_->segment_global_start(
+                static_cast<int>(pid), seg_in_pid);
+            return SlabIndex<B>(global_start + seg_local);
+        }
         return SlabIndex<B>(seg * static_cast<uint32_t>(slabs_per_segment_) + seg_local);
     }
     

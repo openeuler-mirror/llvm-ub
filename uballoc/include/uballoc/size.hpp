@@ -124,9 +124,9 @@ public:
     static constexpr size_t SLAB_SIZE = 4 * 1024 * 1024;
     static constexpr size_t SLAB_CAPACITY = 512;
     static constexpr size_t RESERVATION_SIZE = SLAB_CAPACITY * SLAB_SIZE;
-    static constexpr size_t MIN_SIZE = 20480;
-    static constexpr size_t COUNT = 32;
-    static constexpr size_t MAX_SIZE_VAL = 4 * 1024 * 1024;
+    static constexpr size_t MIN_SIZE = 16385;
+    static constexpr size_t COUNT = 28;
+    static constexpr size_t MAX_SIZE_VAL = 2 * 1024 * 1024;
     
     using ArrayType = std::array<uint64_t, COUNT>;
     using BitSetType = BitSet<64>;
@@ -134,6 +134,13 @@ public:
     // 4-per-doubling size class table. See Small::SIZES for the PERFORMANCE
     // WARNING about new_from_size()'s binary search and recommended O(1)
     // optimizations (bit-trick variant for Large).
+    //
+    // Upper bound lowered from 4MB to 2MB: classes 2MB..4MB (2621440,
+    // 3145728, 3670016, 4194304) were dropped, routing [2MB, 4MB) requests
+    // to Huge (2MB slots). HugeSize::MIN_SIZE was lowered from 4MB to 2MB
+    // to keep the Large/Huge boundary contiguous (no routing gap). COUNT went
+    // 32→28 (still fits u5/32). Cost: [2MB,4MB) requests lose exact Large
+    // classes (e.g. 3MB was 0% waste → now 2 Huge slots = 4MB, 33% waste).
     static constexpr std::array<uint64_t, COUNT> SIZES = {
         20480, 24576, 28672, 32768,
         40960, 49152, 57344, 65536,
@@ -141,8 +148,7 @@ public:
         163840, 196608, 229376, 262144,
         327680, 393216, 458752, 524288,
         655360, 786432, 917504, 1048576,
-        1310720, 1572864, 1835008, 2097152,
-        2621440, 3145728, 3670016, 4194304
+        1310720, 1572864, 1835008, 2097152
     };
     
 private:
@@ -196,39 +202,41 @@ struct LargeTrait {
 class HugeSize {
 public:
     static constexpr const char* NAME = "huge";
-    // FRAGMENTATION WARNING: 4MB slot size causes significant internal waste
-    // for non-multiple-of-4MB Huge allocations. Example: 5MB alloc → 2 slots
-    // = 8MB → 3MB waste (37.5%). Worst case at the boundary (4MB+1 byte) is
-    // ~50% waste (2 slots = 8MB for 4MB+1 of data).
+    // Slot granularity = 2MB
     //
-    // This granularity is COARSER than necessary. UBSE's shm granularity is
-    // 2MB above the 4MB minimum (see UBShmProvider::shm_size_granularity in
-    // ubshm_provider.hpp: 4MB min, 2MB multiples above). POSIX has no such
-    // constraint. So 4MB slots leave shm space on the table for sub-4MB
-    // remainders.
+    // Halving to 2MB reduces Huge rounding waste:
+    //   - 4MB+1 byte: 2 slots (4MB) → 3 slots (6MB), worst-case waste ~50%
+    //     (was ~50% at 8MB; still 50% ratio but 6MB < 8MB absolute).
+    //   - 5MB: 2 slots (8MB, 60% waste) → 3 slots (6MB, 20% waste).
+    //   - 6MB: 2 slots (8MB, 33% waste) → 3 slots (6MB, 0% waste).
+    //   - 9MB: 3 slots (12MB, 33% waste) → 5 slots (10MB, 11% waste).
     //
-    // RECOMMENDED OPTIMIZATION (not yet implemented): reduce SLAB_SIZE to
-    // 2MB, keep MIN_SIZE = 4MB. Effects:
-    //   - Worst-case internal waste halves (~50% → ~33% at the 4MB+1 byte
-    //     boundary; 5MB → 6MB not 8MB; 6MB → 6MB not 8MB; 9MB → 10MB not
-    //     12MB).
-    //   - Aligns slot size with UBSE shm granularity — no wasted shm space.
-    //   - slot_count doubles in HugeShared bitmap (negligible metadata cost;
-    //     Huge regions are 100s of MB).
-    //   - class_size_from_offset returns less inflated values → realloc-shrink
-    //     threshold triggers earlier (more accurate behavior; realloc(p, 6MB)
-    //     on a 5MB alloc would now expand since class_size=6MB, vs current
-    //     class_size=8MB which in-place shrinks).
-    //   - Boundary discontinuity remains (4MB → 4MB+1 jumps to 6MB, not 4MB)
-    //     but only half as bad as today.
-    //   - Requires LAYOUT_VERSION bump (4 → 5) — incompatible with current
-    //     Huge shms; tests must clean up before running.
-    // See Phase 3 design notes for full analysis of alternatives considered
-    // (Option B: lower MIN_SIZE to 2MB — drops Large's top 5 classes;
-    //  Option C: variable slot size — breaks contiguous-allocation invariant;
-    //  Option D: 1MB slot — sub-UBSE-granularity, wastes shm space).
-    static constexpr size_t SLAB_SIZE = 4 * 1024 * 1024;
-    static constexpr size_t MIN_SIZE = 4 * 1024 * 1024;
+    // UBSE safety: UBShmProvider::min_shm_size (4MB) is enforced at the shm
+    // layer (see ubshm_provider.hpp:25), constraining segments (128MB ≫ 4MB),
+    // not slots. POSIX has no minimum. So 2MB slots leave no shm space on
+    // the table for sub-4MB remainders.
+    //
+    // MIN_SIZE lowered from 4MB to 2MB (Large upper-bound lowering): Large's
+    // MAX_SIZE_VAL was lowered from 4MB to 2MB, so Huge must cover [2MB, inf)
+    // to keep the Large/Huge boundary contiguous (no routing gap). A 2MB
+    // request now routes to Huge (1 slot = 2MB, 0% waste) instead of Large's
+    // 2MB class (2097152, also 0% waste) — footprint is identical, but Huge
+    // is used for the [2MB, 4MB) range that Large no longer covers. The 4
+    // Large classes dropped (2621440, 3145728, 3670016, 4194304) are replaced
+    // by 2MB-slot Huge rounding: 3MB → 2 slots (4MB, 33% waste, was 0%).
+    //
+    // MAX_SIZE_VAL = SLAB_SIZE = 2MB = MIN_SIZE now. HugeSize::new_from_size
+    // routes by `size >= MIN_SIZE`, never by MAX_SIZE_VAL (HugeSize has
+    // COUNT=1, no class enumeration). MAX_SIZE_VAL is retained only for API
+    // symmetry with Small/Large; it is unused in routing. The static_assert
+    // invariants at the bottom of this file check Small↔Large and Large↔Huge
+    // MIN_SIZE boundaries, not SLAB_SIZE.
+    //
+    // Cost: HUGE_SLOTS_PER_SEGMENT doubles (32→64) → MAX_HUGE_SLOTS doubles
+    // → HugeShared dynamic slots array in per-process metadata doubles
+    // (~2→4MB/process). Requires LAYOUT_VERSION bump (6→7).
+    static constexpr size_t SLAB_SIZE = uballoc::HUGE_SLAB_SIZE;
+    static constexpr size_t MIN_SIZE = 2 * 1024 * 1024;
     static constexpr size_t MAX_SIZE_VAL = SLAB_SIZE;
     static constexpr size_t COUNT = 1;
     
@@ -264,5 +272,14 @@ struct HugeTrait {
 
 using SmallSize = Small;
 using LargeSize = Large;
+
+// Routing-continuity invariants: the three brackets must tile [8, inf) with
+// no gaps and no overlap. Small covers [8, 16384], Large covers [16385, 2MB),
+// Huge covers [2MB, inf). These guards catch the (16KB, 20KB) gap regression
+// and any future boundary drift at compile time.
+static_assert(Small::MAX_SIZE_VAL + 1 == Large::MIN_SIZE,
+              "Small/Large boundary must be contiguous (no routing gap)");
+static_assert(Large::MAX_SIZE_VAL == HugeSize::MIN_SIZE,
+              "Large/Huge boundary must be contiguous (no routing gap)");
 
 }

@@ -1139,10 +1139,16 @@ public:
             SegmentHeader* hdr = seg_base ? reinterpret_cast<SegmentHeader*>(seg_base) : nullptr;
             uint64_t idle_ns = hdr ? (steady_now_ns() - hdr->free_since_ns.load(std::memory_order_relaxed)) : 0;
             size_t slab_count = 0;
-            if (bracket == 0) slab_count = SegmentLayout<Small>::compute(
-                SegmentLayout<Small>::virtual_slabs_per_segment()).slab_count;
-            else if (bracket == 1) slab_count = SegmentLayout<Large>::compute(
-                SegmentLayout<Large>::virtual_slabs_per_segment()).slab_count;
+            SegmentDirectory* log_dir = segment_directory(rank_, bracket);
+            if (log_dir && seg_idx < static_cast<int>(MAX_SEGMENTS)) {
+                slab_count = log_dir->descs[seg_idx].slab_count;
+            }
+            if (slab_count == 0) {
+                if (bracket == 0) slab_count = SegmentLayout<Small>::compute(
+                    SegmentLayout<Small>::virtual_slabs_per_segment()).slab_count;
+                else if (bracket == 1) slab_count = SegmentLayout<Large>::compute(
+                    SegmentLayout<Large>::virtual_slabs_per_segment()).slab_count;
+            }
 
             LOG_INFO("[RECLAIM] DETACH bracket=" << bracket
                      << " seg=" << seg_idx
@@ -1546,7 +1552,7 @@ public:
     ReturnStats return_stats() const {
         ReturnStats stats;
         if (rank_ < 0) return stats;
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < DATA_BRACKETS; ++b) {
             for (size_t s = 0; s < segments_[rank_][b].size(); ++s) {
                 auto state = segments_[rank_][b][s].state;
                 if (state == SegmentEntry::State::LIVE) stats.segments_live++;
@@ -1560,6 +1566,11 @@ public:
         stats.returned_to_os_bytes = returned_to_os_bytes_;
         stats.allocated_to_app_bytes = uballoc::stats_allocated_to_app().load(std::memory_order_relaxed);
         stats.freed_from_app_bytes = uballoc::stats_freed_from_app().load(std::memory_order_relaxed);
+        uint64_t held = (stats.requested_from_os_bytes >= stats.returned_to_os_bytes)
+            ? (stats.requested_from_os_bytes - stats.returned_to_os_bytes) : 0;
+        uint64_t in_use = (stats.allocated_to_app_bytes >= stats.freed_from_app_bytes)
+            ? (stats.allocated_to_app_bytes - stats.freed_from_app_bytes) : 0;
+        stats.fragmentation_ratio = (in_use > 0) ? (double)held / in_use : 0.0;
         return stats;
     }
 

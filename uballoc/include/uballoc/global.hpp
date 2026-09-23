@@ -28,6 +28,13 @@
 
 namespace uballoc {
 
+// Defrag hint — a live allocation in a low-occupancy memory region.
+struct DefragHint {
+    void* ptr;
+    size_t size;
+    double occupancy;
+};
+
 template<typename BackendT = DistributedShmBackend<>>
 class GlobalAllocator {
 private:
@@ -397,6 +404,7 @@ public:
             total_slab_count_small, total_slab_count_small,
             SEGMENT_VA_SIZE, SegmentLayout<Small>::virtual_slabs_per_segment(),
             small_seg_layout.data_offset);
+        small_data_.set_slabs(&small_slab_);
 
         char* global_data_large_start = reinterpret_cast<char*>(
             backend_.segment_va(0, 1, 0));
@@ -408,6 +416,7 @@ public:
             total_slab_count_large, total_slab_count_large,
             SEGMENT_VA_SIZE, SegmentLayout<Large>::virtual_slabs_per_segment(),
             large_seg_layout.data_offset);
+        large_data_.set_slabs(&large_slab_);
 
         char* global_data_huge_start = reinterpret_cast<char*>(
             backend_.segment_va(rank, 2, 0));
@@ -1104,24 +1113,169 @@ public:
 
     ReturnStats return_stats() {
         init();
-        return backend_.return_stats();
+        ReturnStats stats = backend_.return_stats();
+
+        return stats;
+    }
+
+    // Collect defrag hints — live allocations in slabs with
+    // occupancy < threshold. The application should relocate these
+    // (malloc + memcpy + fix refs + free) to consolidate sparse slabs.
+    std::vector<DefragHint> defrag_hints(double threshold, size_t max_hints = SIZE_MAX) {
+        init();
+        std::vector<DefragHint> hints;
+        hints.reserve(std::min(max_hints, static_cast<size_t>(1024)));
+
+        collect_defrag_hints<Small>(
+            small_slab_, small_data_, small_shared_ptrs_[rank_],
+            SegmentLayout<Small>::virtual_slabs_per_segment(),
+            threshold, max_hints, hints);
+
+        if (hints.size() < max_hints) {
+            collect_defrag_hints<Large>(
+                large_slab_, large_data_, large_shared_ptrs_[rank_],
+                SegmentLayout<Large>::virtual_slabs_per_segment(),
+                threshold, max_hints - hints.size(), hints);
+        }
+
+        return hints;
+    }
+
+    // Template helper — traverse SlabLocal array, find low-occupancy
+    // slabs, enumerate live blocks (BitSet bit=0), generate hints.
+    template<typename B>
+    void collect_defrag_hints(Slab<B>& slabs, Data<B>& data,
+                              HeapShared<B>* shared,
+                              size_t sps,
+                              double threshold, size_t max_hints,
+                              std::vector<DefragHint>& hints) {
+        if (!shared) return;
+
+        for (uint32_t seg = 0; seg < slabs.segment_counts[rank_]; ++seg) {
+            if (hints.size() >= max_hints) return;
+            auto& slice = slabs.local_slices[rank_][seg];
+            auto* base = slice.data();
+            if (!base) continue;
+
+            // Use per-segment slab_count (not sps)
+            size_t seg_slab_count = slabs.seg_slab_counts_[rank_][seg];
+            if (seg_slab_count == 0) seg_slab_count = sps;
+
+            for (size_t i = 0; i < seg_slab_count; ++i) {
+                SlabLocal<B>& sl = base[i];
+
+                // Skip detached slabs (being reclaimed)
+                if (sl.detached.load(std::memory_order_relaxed) != 0) continue;
+
+                uint8_t class_idx = sl.class_.load(std::memory_order_relaxed);
+                if (class_idx == 0) continue;  // skip uninit slabs
+                auto cls_opt = B::from_index(class_idx);
+                if (!cls_opt) continue;
+                B class_ = *cls_opt;
+
+                size_t total_blocks = class_.count();
+                if (total_blocks == 0) continue;
+
+                size_t free_blocks = sl.free.len();
+                size_t used_blocks = total_blocks - free_blocks;
+                double occupancy = (double)used_blocks / total_blocks;
+
+                // Only collect from low-occupancy slabs that have live blocks
+                if (occupancy >= threshold || used_blocks == 0) continue;
+
+                // Enumerate live blocks (BitSet: bit=1 means free, bit=0 means used)
+                // We need to find blocks where the bit is NOT set (used).
+                for (size_t row = 0; row < B::BitSetType::SIZE_DATA; ++row) {
+                    uint64_t bits = sl.free.dense[row];
+                    if (bits == ~0ULL) continue;  // all free, skip
+
+                    for (size_t col = 0; col < 64; ++col) {
+                        if (bits & (1ULL << col)) continue;  // this block is free
+
+                        // This block is used → generate hint
+                        size_t block_index = row * 64 + col;
+                        if (block_index >= total_blocks) break;
+
+                        SlabIndex<B> slab_idx(slabs.segment_global_start(rank_, seg) + i);
+                        Offset<B> offset = data.from_block(class_, slab_idx,
+                            Bit(u6(static_cast<uint8_t>(row)),
+                                u6(static_cast<uint8_t>(col))));
+                        void* ptr = reinterpret_cast<void*>(
+                            reinterpret_cast<char*>(data.base_) + offset.get());
+
+                        hints.push_back({ptr, class_.size(), occupancy});
+                        if (hints.size() >= max_hints) return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Ladder segment size function.
+    // Returns the actual slab_count (after compute cap) so that
+    // requested_slabs == compute(requested_slabs).slab_count.
+    // This avoids confusion where create_data_segment logs a different
+    // slabs value than grow_segment.
+    static size_t segment_ladder_slab_count(size_t slab_size, size_t sps, uint32_t seg_idx) {
+        size_t requested;
+        if (seg_idx == 0)      requested = std::max(size_t(1), sps / 32);  // ~4MB
+        else if (seg_idx == 1) requested = std::max(size_t(1), sps / 8);   // ~16MB
+        else if (seg_idx == 2) requested = std::max(size_t(1), sps / 2);   // ~64MB
+        else                   requested = sps;                              // 128MB full
+        // Return compute().slab_count so requested == actual
+        (void)slab_size;  // slab_size not used; compute uses B::SLAB_SIZE internally
+        return requested;
+    }
+
+    // Cumulative slab count for the first seg_count segments.
+    // Reads from seg_slab_counts_ (clamped slab_count) to match the
+    // actual bump allocation ranges (which use sl.slab_count, not sps).
+    size_t cumulative_slab_count(int bracket, uint32_t seg_count) {
+        if (seg_count == 0) return 0;
+        size_t total = 0;
+        if (bracket == 0) {
+            for (uint32_t i = 0; i < seg_count && i < MAX_SEGMENTS; ++i) {
+                size_t sc = small_slab_.seg_slab_counts_[rank_][i];
+                total += (sc > 0) ? sc : small_slab_.slabs_per_segment_;
+            }
+        } else if (bracket == 1) {
+            for (uint32_t i = 0; i < seg_count && i < MAX_SEGMENTS; ++i) {
+                size_t sc = large_slab_.seg_slab_counts_[rank_][i];
+                total += (sc > 0) ? sc : large_slab_.slabs_per_segment_;
+            }
+        }
+        return total;
     }
 
     bool grow_segment(int bracket) {
         if (bracket == 0) {
             size_t sps = SegmentLayout<Small>::virtual_slabs_per_segment();
+            size_t max_slabs = SegmentLayout<Small>::compute(sps).slab_count;
             uint32_t seg_count = small_shared_ptrs_[rank_]->segment_count_.load(std::memory_order_relaxed);
 
-            auto res = backend_.create_data_segment(0, sps);
+            size_t requested = segment_ladder_slab_count(Small::SLAB_SIZE, max_slabs, seg_count);
+            // Use compute().slab_count so create_data_segment sees the
+            // actual number of slabs (compute may cap it to fit target size).
+            requested = SegmentLayout<Small>::compute(requested).slab_count;
+            auto res = backend_.create_data_segment(0, requested);
             if (is_err(res)) return false;
             int seg_idx = unwrap(res);
 
             char* seg_base = static_cast<char*>(backend_.data_address(rank_, 0, seg_idx));
-            auto sl = SegmentLayout<Small>::compute(sps);
+            auto sl = SegmentLayout<Small>::compute(requested);
             small_slab_.register_segment(rank_, seg_idx,
-                sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base));
+                sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base),
+                sl.slab_count);
 
-            size_t global_start = cumulative_small_[rank_] + seg_count * sps;
+            // Eager touch — fault in the new segment's first data page
+            // BEFORE enabling bump. Ensures uffd handler attaches the segment's
+            // shm before any bump() returns a slab index in this segment.
+            {
+                volatile char touch = *(seg_base + sl.data_offset);
+                (void)touch;
+            }
+
+            size_t global_start = cumulative_small_[rank_] + cumulative_slab_count(0, seg_count);
             small_shared_ptrs_[rank_]->bump_raw.store(
                 SlabIndex<Small>(global_start).internal(), std::memory_order_release);
             small_shared_ptrs_[rank_]->bump_end_atomic_.store(
@@ -1134,18 +1288,28 @@ public:
             return true;
         } else if (bracket == 1) {
             size_t sps = SegmentLayout<Large>::virtual_slabs_per_segment();
+            size_t max_slabs = SegmentLayout<Large>::compute(sps).slab_count;
             uint32_t seg_count = large_shared_ptrs_[rank_]->segment_count_.load(std::memory_order_relaxed);
 
-            auto res = backend_.create_data_segment(1, sps);
+            size_t requested = segment_ladder_slab_count(Large::SLAB_SIZE, max_slabs, seg_count);
+            requested = SegmentLayout<Large>::compute(requested).slab_count;
+            auto res = backend_.create_data_segment(1, requested);
             if (is_err(res)) return false;
             int seg_idx = unwrap(res);
 
             char* seg_base = static_cast<char*>(backend_.data_address(rank_, 1, seg_idx));
-            auto sl = SegmentLayout<Large>::compute(sps);
+            auto sl = SegmentLayout<Large>::compute(requested);
             large_slab_.register_segment(rank_, seg_idx,
-                sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base));
+                sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base),
+                sl.slab_count);
 
-            size_t global_start = cumulative_large_[rank_] + seg_count * sps;
+            // Eager touch (same as Small)
+            {
+                volatile char touch = *(seg_base + sl.data_offset);
+                (void)touch;
+            }
+
+            size_t global_start = cumulative_large_[rank_] + cumulative_slab_count(1, seg_count);
             large_shared_ptrs_[rank_]->bump_raw.store(
                 SlabIndex<Large>(global_start).internal(), std::memory_order_release);
             large_shared_ptrs_[rank_]->bump_end_atomic_.store(
@@ -1157,6 +1321,12 @@ public:
             check_remote_segments();
             return true;
         } else {
+            // Huge keeps uniform 128MB segments (HUGE_SLOTS_PER_SEGMENT).
+            // Unlike Small/Large, Huge slots are addressed as a flat array
+            // (base + slot * SLAB_SIZE) which assumes contiguous data across
+            // segments at 128MB VA boundaries. Ladder segments would break
+            // this flat addressing since slots 2+ would land outside the
+            // first segment's 4MB shm range.
             auto res = backend_.create_data_segment(2, HUGE_SLOTS_PER_SEGMENT);
             if (is_err(res)) return false;
 
@@ -1222,14 +1392,24 @@ public:
                 for (int s = known; s < available; ++s) {
                     char* seg_base = static_cast<char*>(backend_.data_address(k, b, s));
                     if (!seg_base) continue;
+                    auto* dir = backend_.segment_directory(k, b);
+                    size_t actual_slab_count = (dir && s < static_cast<int>(MAX_SEGMENTS))
+                        ? dir->descs[s].slab_count : 0;
+                    if (actual_slab_count == 0) {
+                        actual_slab_count = (b == 0)
+                            ? backend_.config_.slab_count_small[k]
+                            : backend_.config_.slab_count_large[k];
+                    }
                     if (b == 0) {
-                        auto sl = SegmentLayout<Small>::compute(backend_.config_.slab_count_small[k]);
+                        auto sl = SegmentLayout<Small>::compute(actual_slab_count);
                         small_slab_.register_segment(k, s,
-                            sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base));
+                            sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base),
+                            sl.slab_count);
                     } else {
-                        auto sl = SegmentLayout<Large>::compute(backend_.config_.slab_count_large[k]);
+                        auto sl = SegmentLayout<Large>::compute(actual_slab_count);
                         large_slab_.register_segment(k, s,
-                            sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base));
+                            sl.slab_local_ptr(seg_base), sl.slab_remote_ptr(seg_base),
+                            sl.slab_count);
                     }
                 }
             }
@@ -1299,6 +1479,15 @@ public:
 
     void* realloc(void* ptr, size_t size) {
         return current_allocator().realloc(ptr, size);
+    }
+
+    // Returns the usable size of the allocation at `ptr`.
+    // This is the size class (slab/slot) size, which may be >= the
+    // originally requested size (internal fragmentation).
+    // Returns 0 for nullptr or unrecognized pointers.
+    size_t usable_size(void* ptr) {
+        if (!ptr) return 0;
+        return current_allocator().class_size(ptr);
     }
 
     void* data_small_base() { return reinterpret_cast<char*>(small_data_.offset_to_pointer<char>(Offset<Small>(Small::SLAB_SIZE))); }
@@ -1655,6 +1844,14 @@ inline void purge() {
 
 inline ReturnStats return_stats() {
     return get_global_allocator().return_stats();
+}
+
+inline size_t usable_size(void* ptr) {
+    return get_global_allocator().usable_size(ptr);
+}
+
+inline std::vector<DefragHint> defrag_hints(double threshold, size_t max_hints = SIZE_MAX) {
+    return get_global_allocator().defrag_hints(threshold, max_hints);
 }
 
 inline Allocator<void, void>& current_allocator() {

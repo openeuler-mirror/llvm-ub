@@ -94,12 +94,41 @@ struct SegmentLayout {
 
         layout.slab_count = std::min(requested_slabs, max_slabs);
 
+        // Metadata is always allocated for max_slabs so that data_offset is
+        // constant regardless of requested_slabs. This is required because
+        // Data<B>::data_offset_ is a single global value used by
+        // from_block/into_index for ALL segments.
         layout.slab_remote_offset = segment_align_up(
             layout.slab_local_offset + max_slabs * sizeof(SlabLocal<B>),
             alignof(Detectable<Remote>));
         layout.data_offset = segment_align_up(
             layout.slab_remote_offset + max_slabs * sizeof(Detectable<Remote>),
             SIZE_PAGE);
+
+        // Cap total_size so that ladder segments are truly 4/16/64/128MB.
+        // data_offset is ~2MB (max_slabs metadata). For a 4MB target, data area
+        // = 4MB - 2MB = 2MB = 64 slabs (32KB each). slab_count is capped so
+        // that data_offset + slab_count * SLAB_SIZE <= target_bytes.
+        // requested_slabs encodes the target: 4MB→sps/32, 16MB→sps/8, etc.
+        // We detect the target from requested_slabs relative to max_slabs:
+        //   sps/32 → 4MB, sps/8 → 16MB, sps/2 → 64MB, sps → 128MB (no cap)
+        if (requested_slabs < max_slabs && max_slabs > 0) {
+            // Determine target bytes from the requested/max ratio
+            size_t ratio = max_slabs / requested_slabs;
+            size_t target_bytes;
+            if (ratio >= 32)      target_bytes = 4 * 1024 * 1024;
+            else if (ratio >= 8)  target_bytes = 16 * 1024 * 1024;
+            else if (ratio >= 2)  target_bytes = 64 * 1024 * 1024;
+            else                  target_bytes = SEGMENT_VA_SIZE;
+
+            if (target_bytes < SEGMENT_VA_SIZE && target_bytes > layout.data_offset) {
+                size_t max_data_slabs = (target_bytes - layout.data_offset) / B::SLAB_SIZE;
+                if (layout.slab_count > max_data_slabs) {
+                    layout.slab_count = max_data_slabs;
+                }
+            }
+        }
+
         layout.total_size = segment_align_up(
             layout.data_offset + layout.slab_count * B::SLAB_SIZE,
             SIZE_PAGE);
@@ -129,8 +158,8 @@ inline SegmentHeader* slab_segment_header(Slab<B>& slabs, SlabIndex<B> global_id
     int pid = slabs.find_process(global_idx.get());
     if (pid < 0 || pid >= static_cast<int>(MAX_PROCESSES)) return nullptr;
     size_t local_idx = global_idx.get() - slabs.cumulative[pid];
-    size_t seg = (slabs.slabs_per_segment_ > 0)
-        ? local_idx / slabs.slabs_per_segment_ : 0;
+    auto [seg, seg_local_unused] = slabs.find_segment(pid, local_idx);
+    (void)seg_local_unused;
     if (seg >= MAX_SEGMENTS) return nullptr;
     SlabSlice<B, SlabLocal<B>>& slice = slabs.local_slices[pid][seg];
     SlabLocal<B>* base = slice.data();

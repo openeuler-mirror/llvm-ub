@@ -20,13 +20,15 @@ Applicable scenarios: allocation, free, publish, discovery, and cross-node acces
 
 | Feature | Description |
 |---------|-------------|
-| Three-tier size-class heap | Objects are classified by size into Small (8 B–16 KB, 37 classes, 4-per-doubling spacing, 32 KB slab), Large (20 KB–4 MB, 32 classes, 4-per-doubling spacing, 4 MB slab), and Huge (≥4 MB, 4 MB slot). Each allocation matches the nearest class, reducing internal fragmentation (≤25%). |
+| Three-tier size-class heap | Objects are classified by size into Small (8 B–16 KB, 37 classes, 4-per-doubling spacing, 32 KB slab), Large (16 KB–2 MB, 28 classes, 4-per-doubling spacing, 4 MB slab), and Huge (≥2 MB, 2 MB slot). Each allocation matches the nearest class, reducing internal fragmentation (≤25%). |
+| Ladder segment growth | Small/Large segments grow in 4MB→16MB→64MB→128MB steps; first allocation uses only 4MB (not a full 128MB segment), reducing initial memory footprint (12MB total for all three brackets vs 384MB). Huge segments remain 128MB. |
 | Fixed-VA cross-process sharing | ~28 TB of virtual address space is reserved; all nodes use the same VA base (`DEFAULT_VA_BASE=0x200000000000`), so the same pointer is semantically equivalent across all processes — no address translation required. |
 | type_id-based publish/discovery | `malloc(size, type_id)` performs allocation and publish in one call; any process can discover regions published by others via `lookup_by_type(type_id)` (blocking or non-blocking). `owner_process` is registered atomically via CAS, guaranteeing a single owner per type_id. |
 | Dynamic membership discovery | After setting the `UBALLOC_HEAP_ID` environment variable, a process discovers its rank and total membership automatically via a bootstrap shared-memory block — no need to know `rank` or `total_processes` in advance. |
 | uffd on by default | A constructor at priority 102 automatically installs the uffd handler thread, which loads remote data segments on demand. When uffd is unavailable, it falls back to the SIGSEGV fault handler. `init()` also calls `try_enable_uffd_locked()` at the end. |
 | Asynchronous memory reclaim | Supports SYNC/ASYNC modes for returning idle Small/Large segments to the OS. ASYNC mode (default) uses a background thread with jemalloc-style timed scanning — zero hot-path overhead on malloc/free. SYNC mode triggers inline in malloc/free. The `decay1`/`decay2` timers control the LIVE→DETACHED→RETURNED state machine; `purge()` skips timers for immediate return. |
-| Memory statistics | Query memory flow statistics via `return_stats()`: bytes requested from OS, bytes returned to OS, bytes allocated to app, bytes freed by app, current held/in-use, efficiency ratio, etc. In ASYNC mode, the background thread auto-emits `[RECLAIM-STATS]` log every 30 scans. |
+| Memory statistics & introspection | Query memory flow statistics via `return_stats()`: bytes requested from OS, bytes returned to OS, bytes allocated to app, bytes freed by app, and `fragmentation_ratio`. In ASYNC mode, the background thread auto-emits `[RECLAIM-STATS]` log every 30 scans. |
+| Defragmentation | `uballoc::usable_size(ptr)` returns the usable size of an allocation (for right-sizing to avoid unnecessary reallocs); `uballoc::defrag_hints(threshold)` returns live allocations in low-occupancy memory regions; the application performs malloc+memcpy+fixrefs+free for cooperative defragmentation. |
 | CRTP zero-overhead backend | The backend dispatches statically via CRTP — no virtual calls on the allocation hot path. ARMv8.1 LSE atomics are optional, compile-time toggleable. |
 | Crash recovery | Three optional mechanisms — detectable CAS, state logging, cache flushing — support post-crack scan-and-rebuild of allocator state. |
 
@@ -1088,22 +1090,16 @@ void uballoc_return_stats(uballoc_return_stats_t *out);
 
 ```cpp
 struct ReturnStats {
-    // Segment snapshot (current state counts)
-    size_t segments_live;        // LIVE segments (in use)
-    size_t segments_detached;    // DETACHED segments (pending return)
-    size_t segments_returned;    // RETURNED segments (returned to OS)
-
-    // Cumulative transitions
+    size_t segments_live;
+    size_t segments_detached;
+    size_t segments_returned;
     size_t total_detached_count;
     size_t total_returned_count;
-    size_t total_recreated_count;
-
-    // Byte-level cumulative statistics
-    uint64_t requested_from_os_bytes;   // Total bytes requested from OS
-    uint64_t returned_to_os_bytes;      // Total bytes returned to OS
-    uint64_t allocated_to_app_bytes;    // Total bytes allocated to app
-    uint64_t freed_from_app_bytes;      // Total bytes freed by app
-    uint64_t thrash_events;             // Thrash events (LIVE→DETACHED→LIVE)
+    uint64_t requested_from_os_bytes;
+    uint64_t returned_to_os_bytes;
+    uint64_t allocated_to_app_bytes;
+    uint64_t freed_from_app_bytes;
+    double fragmentation_ratio;
 };
 ```
 
@@ -1116,34 +1112,34 @@ typedef struct {
     size_t segments_returned;
     size_t total_detached_count;
     size_t total_returned_count;
-    size_t total_recreated_count;
     uint64_t requested_from_os_bytes;
     uint64_t returned_to_os_bytes;
     uint64_t allocated_to_app_bytes;
     uint64_t freed_from_app_bytes;
-    uint64_t thrash_events;
+    double   fragmentation_ratio;
 } uballoc_return_stats_t;
 ```
 
-**Computed fields**
+**Field descriptions**
 
-| Metric | Formula | Meaning |
-|--------|---------|---------|
-| Currently held | `requested_from_os_bytes - returned_to_os_bytes` | Memory uballoc holds from OS |
-| Currently in use | `allocated_to_app_bytes - freed_from_app_bytes` | Memory app currently occupies |
-| Efficiency | `in_use / held` | High=compact, low=hoarding |
+| Field | Description |
+|-------|-------------|
+| `segments_live` | LIVE segments (in use) |
+| `segments_detached` | DETACHED segments (pending return) |
+| `segments_returned` | RETURNED segments (returned to OS) |
+| `total_detached_count` | Cumulative detach count |
+| `total_returned_count` | Cumulative return count |
+| `requested_from_os_bytes` | Total bytes requested from OS |
+| `returned_to_os_bytes` | Total bytes returned to OS |
+| `allocated_to_app_bytes` | Total bytes allocated to app |
+| `freed_from_app_bytes` | Total bytes freed by app |
+| `fragmentation_ratio` | Fragmentation ratio = `(requested - returned) / (allocated - freed)`, >1.0 means fragmentation |
 
 **Example (C++)**
 
 ```cpp
 auto stats = uballoc::return_stats();
-uint64_t held = stats.requested_from_os_bytes - stats.returned_to_os_bytes;
-uint64_t in_use = stats.allocated_to_app_bytes - stats.freed_from_app_bytes;
-double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
-
-std::cout << "held=" << held / (1024*1024) << "MB"
-          << " in_use=" << in_use / (1024*1024) << "MB"
-          << " efficiency=" << efficiency << "%"
+std::cout << "frag_ratio=" << stats.fragmentation_ratio
           << " live=" << stats.segments_live
           << " detached=" << stats.segments_detached
           << " returned=" << stats.segments_returned
@@ -1155,16 +1151,126 @@ std::cout << "held=" << held / (1024*1024) << "MB"
 ```c
 uballoc_return_stats_t s;
 uballoc_return_stats(&s);
-uint64_t held = s.requested_from_os_bytes - s.returned_to_os_bytes;
-uint64_t in_use = s.allocated_to_app_bytes - s.freed_from_app_bytes;
-double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
+printf("frag_ratio=%.2f live=%lu detached=%lu returned=%lu\n",
+       s.fragmentation_ratio, s.segments_live, s.segments_detached, s.segments_returned);
+```
 
-printf("held=%luMB in_use=%luMB efficiency=%.1f%% live=%lu detached=%lu returned=%lu\n",
-       held / (1024*1024), in_use / (1024*1024), efficiency,
+> **Note**: Set `UBALLOC_RECLAIM_STATS=0` to disable byte-level counting (zero hot-path overhead).
        s.segments_live, s.segments_detached, s.segments_returned);
 ```
 
 > **Note**: Set `UBALLOC_RECLAIM_STATS=0` to disable byte-level counting (zero hot-path overhead).
+
+---
+
+### uballoc_usable_size
+
+Query the usable size of an allocation.
+
+**C API:**
+
+```c
+size_t uballoc_usable_size(void *pointer);
+```
+
+**C++ API:**
+
+```cpp
+size_t uballoc::usable_size(void* ptr);
+```
+
+| Parameter | Description | Range | I/O |
+|-----------|-------------|-------|-----|
+| `pointer` | Pointer returned by `uballoc_malloc` | non-NULL | input |
+
+Returns: the usable size of the allocation (>= requested size, may be larger due to internal fragmentation). Returns 0 for NULL or unrecognized pointers.
+
+**Use cases**:
+- **Right-sizing**: if `usable_size(ptr) >= new_size`, no need to call `realloc` — the extra space can be used directly
+- **Fragmentation assessment**: the difference between `usable_size` and the requested size reflects internal allocation waste
+
+**Example**
+
+```cpp
+void* p = uballoc::malloc(63);   // requested 63B, allocated 64B
+size_t us = uballoc::usable_size(p);  // us = 64
+// if you later need 64B: usable_size(64) >= 64, no realloc needed
+uballoc::free(p);
+```
+
+---
+
+### uballoc_defrag_hints
+
+Get a list of live allocations in low-occupancy memory regions for app-cooperative defragmentation.
+
+**C API:**
+
+```c
+size_t uballoc_defrag_hints(double threshold,
+                            uballoc_defrag_hint_t *out,
+                            size_t max_hints);
+```
+
+**C++ API:**
+
+```cpp
+std::vector<uballoc::DefragHint> uballoc::defrag_hints(double threshold);
+```
+
+| Parameter | Description | Range | I/O |
+|-----------|-------------|-------|-----|
+| `threshold` | Memory region occupancy threshold | 0.0~1.0 | input |
+| `out` (C API) | Output array | non-NULL | output |
+| `max_hints` (C API) | Output array capacity | >0 | input |
+
+Returns: C API returns number of hints written to `out`; C++ API returns `std::vector<DefragHint>`.
+
+**`uballoc_defrag_hint_t` / `uballoc::DefragHint` struct**
+
+```c
+typedef struct {
+    void*  ptr;        /* pointer to the live allocation */
+    size_t size;        /* usable size of the allocation */
+    double occupancy;   /* memory region occupancy (0.0~1.0) */
+} uballoc_defrag_hint_t;
+```
+
+| Field | Description |
+|-------|-------------|
+| `ptr` | Pointer to the allocation to relocate |
+| `size` | Usable size of the allocation (same as `usable_size` return) |
+| `occupancy` | Block occupancy of the memory region containing this allocation, 0.0=empty, 1.0=full. Only allocations with occupancy < `threshold` are returned |
+
+**Defrag workflow**
+
+1. Call `return_stats` to check `fragmentation_ratio`
+2. When fragmentation exceeds threshold, call `defrag_hints(0.5)` to get live allocations in low-occupancy regions
+3. For each hint, relocate: `malloc(size)` + `memcpy` + fix references + `free(old_ptr)`
+4. After relocation, call `purge()` to reclaim empty memory regions; fragmentation ratio drops
+
+**Example**
+
+```cpp
+auto stats = uballoc::return_stats();
+double frag = stats.fragmentation_ratio;
+
+if (frag > 1.5) {  // fragmentation ratio > 1.5, start defrag
+    auto hints = uballoc::defrag_hints(0.5);  // regions < 50% occupied
+    for (auto& h : hints) {
+        void* neu = uballoc::malloc(h.size);
+        memcpy(neu, h.ptr, h.size);
+        /* fix all references from h.ptr → neu */
+        uballoc::free(h.ptr);
+    }
+    uballoc::purge();  // reclaim empty regions
+}
+```
+
+> **Note**:
+> - The allocator does not move data, because a C/C++ allocator does not know pointer reference relationships. The application must fix references itself.
+> - `defrag_hints` should be called when no concurrent alloc/free is in progress (e.g., during an application maintenance cycle), to avoid reading memory state being modified by other threads.
+> - Pointers returned by `defrag_hints` may include blocks created by other processes via cross-process allocation. The application must coordinate (publish/unpublish) when relocating cross-process referenced blocks.
 
 ---
 
@@ -1182,11 +1288,11 @@ On grow (`new_size > old_size`), `realloc` allocates a new block, copies data, f
 
 **Special realloc behavior for Huge allocations:**
 
-The `class_size` of a Huge allocation is `slot_count * SLAB_SIZE` (SLAB_SIZE=4 MB), not the actual requested allocation size. For example, a 5 MB Huge allocation occupies 2 slots, so `class_size` is 8 MB.
+The `class_size` of a Huge allocation is `slot_count * SLAB_SIZE` (SLAB_SIZE=2 MB), not the actual requested allocation size. For example, a 5 MB Huge allocation occupies 3 slots, so `class_size` is 6 MB.
 
 This means:
 
-- **`new_size` <= `class_size` (even if `new_size` > original requested size)**: treated as shrink, returns the original pointer. For example, original allocation 5 MB (`class_size`=8 MB), `realloc` to 6 MB → 6 MB <= 8 MB → returns the original pointer, no new block. The excess slot space (8 MB - 6 MB = 2 MB) is wasted.
+- **`new_size` <= `class_size` (even if `new_size` > original requested size)**: treated as shrink, returns the original pointer. For example, original allocation 5 MB (`class_size`=6 MB), `realloc` to 6 MB → 6 MB <= 6 MB → returns the original pointer, no new block. The excess slot space (6 MB - 6 MB = 0 MB) is wasted.
 
 - **`new_size` > `class_size`**: treated as grow, allocates a new block, copies data, frees the old block, returns the new pointer (`!= old_ptr`). Since the old slot is still occupied at `allocate` time (CAS already claimed), the new allocation must land on a different slot, so `new_ptr != old_ptr`.
 
