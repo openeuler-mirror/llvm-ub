@@ -7,7 +7,14 @@ set(UBALLOC_UNIT_TEST_TARGETS
     test_reclaim
     test_size_routing
     test_introspection
-    test_defrag_hints)
+    test_defrag_hints
+    test_ar01_va_layout
+    test_ar04_explicit_init
+    test_ar05_size_classes
+    test_ar06_realloc
+    test_ar09_publish_lookup
+    test_ar10_publishing_malloc
+    test_ar11_stl_containers)
 
 foreach(_target ${UBALLOC_UNIT_TEST_TARGETS})
     add_executable(${_target} ${_target}.cpp)
