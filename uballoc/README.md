@@ -7,12 +7,14 @@
 ## 特性
 
 - **三档大小分类**（每倍增 4 类的粒度）：
-  - Small：8 B – 16 KB，32 KB slab（37 类，7/16 比例）
-  - Large：20 KB – 4 MB，2 MB slab（32 类，5/16 比例）
-  - Huge：> 4 MB，4 MB 槽位（伙伴分配器）
+  - Small：8 B – 16 KB，32 KB slab（37 类，4-per-doubling）
+  - Large：16 KB – 2 MB，4 MB slab（28 类，4-per-doubling）
+  - Huge：> 2 MB，2 MB 槽位（按 slot 数量分配）
+- **段递进式分配**：Small/Large 段按 4MB→16MB→64MB→128MB 阶梯增长，首次分配仅占 4MB（非满段 128MB）
 - **分布式共享内存**：固定虚址 mmap，跨进程分配/释放，跨节点发布/查找
 - **节点内多进程**：按节点引用计数，`claim_rank` 死槽位检测，`node_index` CAS 分配
 - **空闲内存回收**：空闲段经历 LIVE→DETACHED→RETURNED 状态流转，归还至 UBSE 池供跨节点复用
+- **内省与碎片整理**：`return_stats` 提供 per-slab 占用率、Huge slot 统计、空段检测；`defrag_hints` 返回低占用 slab 中的活跃分配列表，供应用协作式碎片整理
 - **延迟挂接**：基于 userfaultfd 的远端数据按需挂接
 - **CRTP 后端**：分配路径中无虚函数调用
 - **ARMv8.1 LSE 原子指令**：编译期开关

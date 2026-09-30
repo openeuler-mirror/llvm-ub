@@ -107,6 +107,9 @@ if(UBALLOC_BUILD_EXAMPLES)
     add_executable(reclaim_example example/reclaim_example.cpp)
     target_link_libraries(reclaim_example PRIVATE uballoc rt pthread)
 
+    add_executable(defrag_example example/defrag_example.cpp)
+    target_link_libraries(defrag_example PRIVATE uballoc rt pthread)
+
 endif()
 
 install(TARGETS uballoc

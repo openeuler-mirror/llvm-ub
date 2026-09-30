@@ -11,6 +11,7 @@
 #include <vector>
 #include <array>
 #include <cstring>
+#include <algorithm>
 
 #include "packed.hpp"
 #include "thread.hpp"
@@ -69,6 +70,8 @@ struct Slab {
     std::array<std::array<SlabSlice<B, Detectable<Remote>>, MAX_SEGMENTS>, MAX_PROCESSES> remote_slices;
     std::array<size_t, MAX_PROCESSES + 1> cumulative;
     std::array<uint32_t, MAX_PROCESSES> segment_counts;
+    // Per-process per-segment slab counts for non-uniform segment sizes.
+    std::array<std::array<size_t, MAX_SEGMENTS>, MAX_PROCESSES> seg_slab_counts_;
     int total_processes;
     size_t slabs_per_process_;
     size_t slabs_per_segment_;
@@ -77,6 +80,9 @@ struct Slab {
         cumulative[0] = 0;
         cumulative[1] = 0;
         for (size_t i = 0; i < MAX_PROCESSES; ++i) segment_counts[i] = 0;
+        for (size_t i = 0; i < MAX_PROCESSES; ++i)
+            for (size_t j = 0; j < MAX_SEGMENTS; ++j)
+                seg_slab_counts_[i][j] = 0;
     }
 
     int find_process(size_t global_idx) const {
@@ -92,43 +98,76 @@ struct Slab {
         return lo;
     }
 
+    // Linear-scan localization of segment from local slab index.
+    struct SegLoc { size_t seg; size_t seg_local; };
+    SegLoc find_segment(int pid, size_t local_idx) const {
+        // Fast path: no per-seg counts registered → uniform division
+        if (segment_counts[pid] == 0 || seg_slab_counts_[pid][0] == 0) {
+            size_t seg = (slabs_per_segment_ > 0)
+                ? local_idx / slabs_per_segment_ : 0;
+            size_t seg_local = (slabs_per_segment_ > 0)
+                ? local_idx % slabs_per_segment_ : local_idx;
+            return {seg, seg_local};
+        }
+        // Linear scan: accumulate slab counts
+        size_t acc = 0;
+        size_t seg = 0;
+        uint32_t max_seg = segment_counts[pid];
+        while (seg < max_seg) {
+            size_t count = seg_slab_counts_[pid][seg];
+            if (count == 0) count = slabs_per_segment_;
+            if (acc + count > local_idx) return {seg, local_idx - acc};
+            acc += count;
+            ++seg;
+        }
+        // Beyond known segments → uniform for remaining
+        size_t remaining = local_idx - acc;
+        size_t full_seg = (slabs_per_segment_ > 0)
+            ? remaining / slabs_per_segment_ : 0;
+        size_t full_seg_local = (slabs_per_segment_ > 0)
+            ? remaining % slabs_per_segment_ : remaining;
+        return {seg + full_seg, full_seg_local};
+    }
+
+    // Returns global slab index of the first slab in segment `seg` for process `pid`.
+    size_t segment_global_start(int pid, size_t seg) const {
+        if (seg == 0) return cumulative[pid];
+        size_t acc = cumulative[pid];
+        uint32_t max_seg = std::min(static_cast<uint32_t>(seg), segment_counts[pid]);
+        for (uint32_t i = 0; i < max_seg; ++i) {
+            size_t count = seg_slab_counts_[pid][i];
+            if (count == 0) count = slabs_per_segment_;
+            acc += count;
+        }
+        if (seg > max_seg) acc += (seg - max_seg) * slabs_per_segment_;
+        return acc;
+    }
+
     SlabLocal<B>& local(SlabIndex<B> global_idx) {
         int pid = find_process(global_idx.get());
         size_t local_idx = global_idx.get() - cumulative[pid];
-        size_t seg = (slabs_per_segment_ > 0)
-            ? local_idx / slabs_per_segment_ : 0;
-        size_t seg_local = (slabs_per_segment_ > 0)
-            ? local_idx % slabs_per_segment_ : local_idx;
+        auto [seg, seg_local] = find_segment(pid, local_idx);
         return local_slices[pid][seg][SlabIndex<B>(seg_local)];
     }
 
     const SlabLocal<B>& local(SlabIndex<B> global_idx) const {
         int pid = find_process(global_idx.get());
         size_t local_idx = global_idx.get() - cumulative[pid];
-        size_t seg = (slabs_per_segment_ > 0)
-            ? local_idx / slabs_per_segment_ : 0;
-        size_t seg_local = (slabs_per_segment_ > 0)
-            ? local_idx % slabs_per_segment_ : local_idx;
+        auto [seg, seg_local] = find_segment(pid, local_idx);
         return local_slices[pid][seg][SlabIndex<B>(seg_local)];
     }
 
     Detectable<Remote>& remote(SlabIndex<B> global_idx) {
         int pid = find_process(global_idx.get());
         size_t local_idx = global_idx.get() - cumulative[pid];
-        size_t seg = (slabs_per_segment_ > 0)
-            ? local_idx / slabs_per_segment_ : 0;
-        size_t seg_local = (slabs_per_segment_ > 0)
-            ? local_idx % slabs_per_segment_ : local_idx;
+        auto [seg, seg_local] = find_segment(pid, local_idx);
         return remote_slices[pid][seg][SlabIndex<B>(seg_local)];
     }
 
     const Detectable<Remote>& remote(SlabIndex<B> global_idx) const {
         int pid = find_process(global_idx.get());
         size_t local_idx = global_idx.get() - cumulative[pid];
-        size_t seg = (slabs_per_segment_ > 0)
-            ? local_idx / slabs_per_segment_ : 0;
-        size_t seg_local = (slabs_per_segment_ > 0)
-            ? local_idx % slabs_per_segment_ : local_idx;
+        auto [seg, seg_local] = find_segment(pid, local_idx);
         return remote_slices[pid][seg][SlabIndex<B>(seg_local)];
     }
 
@@ -140,6 +179,14 @@ struct Slab {
         if (seg_idx + 1 > segment_counts[pid]) {
             segment_counts[pid] = seg_idx + 1;
         }
+    }
+
+    void register_segment(int pid, size_t seg_idx,
+                           SlabLocal<B>* local_base,
+                           Detectable<Remote>* remote_base,
+                           size_t slab_count) {
+        register_segment(pid, seg_idx, local_base, remote_base);
+        seg_slab_counts_[pid][seg_idx] = slab_count;
     }
 
     SlabSlice<B, SlabLocal<B>>& local_slice(int pid, size_t seg) { return local_slices[pid][seg]; }

@@ -55,6 +55,18 @@ void uballoc_free(void *pointer);
 
 void *uballoc_realloc(void *pointer, size_t size);
 
+/**
+ * Returns the usable size of the allocation at `pointer`.
+ *
+ * This is the size-class (slab/slot) size, which may be larger than the
+ * originally requested size due to internal fragmentation. Applications
+ * can use this to right-size allocations and avoid unnecessary reallocs
+ * (e.g., if `uballoc_usable_size(ptr) >= new_size`, no realloc needed).
+ *
+ * Returns 0 for NULL or unrecognized pointers.
+ */
+size_t uballoc_usable_size(void *pointer);
+
 void *uballoc_memalign(size_t size, size_t alignment);
 
 /**
@@ -191,9 +203,45 @@ typedef struct {
     uint64_t returned_to_os_bytes;
     uint64_t allocated_to_app_bytes;
     uint64_t freed_from_app_bytes;
+    double   fragmentation_ratio;
 } uballoc_return_stats_t;
 
 void uballoc_return_stats(uballoc_return_stats_t *out);
+
+/* -------------------------------------------------------------------------
+ * Defragmentation hints.
+ *
+ * Returns a list of live allocations in slabs whose occupancy is below
+ * `threshold`. The application should relocate these allocations:
+ *
+ *     for each hint:
+ *         new = uballoc_malloc(hint.size)
+ *         memcpy(new, hint.ptr, hint.size)
+ *         fix_references(hint.ptr, new)   // application-specific
+ *         uballoc_free(hint.ptr)
+ *
+ * This is the Redis activedefrag pattern: the allocator provides
+ * visibility (which slabs are sparse), the application provides
+ * pointer-fixing. The allocator cannot move objects because it does
+ * not know reference relationships.
+ *
+ * threshold: 0.0~1.0. Slabs with occupancy < threshold are included.
+ *            e.g., 0.5 = slabs less than 50% full.
+ * out:       output array of hints.
+ * max_hints: capacity of the output array.
+ *
+ * Returns: number of hints written to `out` (may be less than the total
+ *          available if `max_hints` is too small).
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    void*  ptr;             /* pointer to the live allocation             */
+    size_t size;            /* usable size of the allocation               */
+    double occupancy;        /* memory region occupancy (0.0~1.0)         */
+} uballoc_defrag_hint_t;
+
+size_t uballoc_defrag_hints(double threshold,
+                            uballoc_defrag_hint_t *out,
+                            size_t max_hints);
 
 /* -------------------------------------------------------------------------
  * Macro overload: uballoc_malloc(...) dispatches to uballoc_malloc_published

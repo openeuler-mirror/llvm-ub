@@ -25,7 +25,7 @@ inline size_t align_up(size_t val, size_t align) {
 
 struct SharedLayout {
     static constexpr uint64_t MAGIC = 0x55BA110C00001ULL;
-    static constexpr uint32_t LAYOUT_VERSION = 6;
+    static constexpr uint32_t LAYOUT_VERSION = 7;
 
     uint64_t magic;
     uint32_t layout_version;

@@ -26,6 +26,10 @@ void *uballoc_realloc(void *pointer, size_t size) {
     return uballoc::get_global_allocator().realloc(pointer, size);
 }
 
+size_t uballoc_usable_size(void *pointer) {
+    return uballoc::get_global_allocator().usable_size(pointer);
+}
+
 void *uballoc_memalign(size_t size, size_t alignment) {
     return uballoc::get_global_allocator().memalign(size, alignment);
 }
@@ -102,6 +106,22 @@ void uballoc_return_stats(uballoc_return_stats_t *out) {
     out->returned_to_os_bytes    = s.returned_to_os_bytes;
     out->allocated_to_app_bytes  = s.allocated_to_app_bytes;
     out->freed_from_app_bytes    = s.freed_from_app_bytes;
+    out->fragmentation_ratio    = s.fragmentation_ratio;
+}
+
+size_t uballoc_defrag_hints(double threshold,
+                            uballoc_defrag_hint_t *out,
+                            size_t max_hints) {
+    if (!out || max_hints == 0) return 0;
+    uballoc::get_global_allocator().init();
+    auto hints = uballoc::get_global_allocator().defrag_hints(threshold, max_hints);
+    size_t n = std::min(hints.size(), max_hints);
+    for (size_t i = 0; i < n; i++) {
+        out[i].ptr = hints[i].ptr;
+        out[i].size = hints[i].size;
+        out[i].occupancy = hints[i].occupancy;
+    }
+    return n;
 }
 
 }

@@ -499,8 +499,8 @@ struct Heap {
 
         int pid = slabs->find_process(idx.get());
         size_t local_idx = idx.get() - slabs->cumulative[pid];
-        size_t seg = (slabs->slabs_per_segment_ > 0)
-            ? local_idx / slabs->slabs_per_segment_ : 0;
+        auto [seg, seg_local_unused] = slabs->find_segment(pid, local_idx);
+        (void)seg_local_unused;
 
         if (slabs->local_slice(pid, seg).base_ == nullptr) {
             auto check_fn = check_remote_fn().load(std::memory_order_acquire);

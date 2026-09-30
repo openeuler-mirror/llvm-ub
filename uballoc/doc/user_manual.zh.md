@@ -20,13 +20,15 @@ uballoc是专为aarch64架构、Linux操作系统下多进程多节点分布式�
 
 | 特性名称 | 特性介绍 |
 |---------|---------|
-| 三档位尺寸分级堆 | 将对象按大小划分为Small（8B–16KB，37类，4-per-doubling间距，32KB slab）、Large（20KB–4MB，32类，4-per-doubling间距，4MB slab）、Huge（≥4MB，4MB slot）三档位，每次分配匹配最接近的档位，降低内部碎片（≤25%）。 |
+| 三档位尺寸分级堆 | 将对象按大小划分为Small（8B–16KB，37类，4-per-doubling间距，32KB slab）、Large（16KB–2MB，28类，4-per-doubling间距，4MB slab）、Huge（≥2MB，2MB slot）三档位，每次分配匹配最接近的档位，降低内部碎片（≤25%）。 |
+| 段递进式分配 | Small/Large段按4MB→16MB→64MB→128MB阶梯增长，首次分配仅占4MB而非满段128MB，降低首次分配的内存占用（三档首次分配总计12MB vs 384MB）。Huge段保持128MB不变。 |
 | 固定VA跨进程共享 | 预留约28TB虚拟地址空间，所有节点采用相同VA基址（`DEFAULT_VA_BASE=0x200000000000`），使同一指针在所有进程语义等价，无需地址翻译。 |
 | 基于type_id的发布/发现 | 调用`malloc(size, type_id)`一次完成分配与发布；任一进程可通过`lookup_by_type(type_id)`阻塞或非阻塞地发现其他进程发布的区域，`owner_process`通过CAS原子登记，保证一种type_id只有一个所有者。 |
 | 动态成员发现 | 设置环境变量`UBALLOC_HEAP_ID`后，进程通过自举（bootstrap）共享内存块自动发现rank与总成员数，无需提前知晓`rank`或`total_processes`。 |
 | uffd默认开启 | 构造器优先级102自动装配uffd handler线程，按需加载远端数据段；当uffd不可用时，回退至SIGSEGV fault handler。`init()`末尾亦会调用`try_enable_uffd_locked()`。 |
 | 异步内存归还 | 支持SYNC/ASYNC两种模式将空闲段（Small/Large）归还给操作系统。ASYNC模式（默认）由后台线程定时扫描归还，malloc/free热路径零开销；SYNC模式在malloc/free内联触发。通过`decay1`/`decay2`定时器控制LIVE→DETACHED→RETURNED状态机转换，`purge()`可跳过定时器立即归还。 |
-| 内存统计 | 通过`return_stats()`查询内存流转统计：从OS申请字节数、归还OS字节数、分配给应用字节数、应用释放字节数、当前持有/使用量、效率比等。ASYNC模式下后台线程每30轮扫描自动输出`[RECLAIM-STATS]`日志。 |
+| 内存统计与内省 | 通过`return_stats()`查询内存流转统计：从OS申请字节数、归还OS字节数、分配给应用字节数、应用释放字节数，以及碎片率`fragmentation_ratio`。ASYNC模式下后台线程每30轮扫描自动输出`[RECLAIM-STATS]`日志。 |
+| 碎片整理 | `uballoc::usable_size(ptr)`返回分配的可用大小（可用于right-sizing避免不必要realloc）；`uballoc::defrag_hints(threshold)`返回低占用率内存区域中的活跃分配列表，应用执行malloc+memcpy+fixrefs+free完成协作式碎片整理。 |
 | CRTP零开销后端 | 后端通过CRTP静态分派，分配热路径无虚函数调用；可选ARMv8.1 LSE原子指令，编译期开关。 |
 | 崩溃恢复 | 可检测CAS、状态日志、缓存刷写三档可选机制，支持崩溃后扫描重建分配器状态。 |
 
@@ -1088,22 +1090,16 @@ void uballoc_return_stats(uballoc_return_stats_t *out);
 
 ```cpp
 struct ReturnStats {
-    // 段级快照（当前时刻各状态段数）
-    size_t segments_live;        // LIVE段数（在用）
-    size_t segments_detached;    // DETACHED段数（待归还）
-    size_t segments_returned;    // RETURNED段数（已归还）
-
-    // 段级累计（累计转换次数）
-    size_t total_detached_count;   // 累计detach次数
-    size_t total_returned_count;   // 累计delete/return次数
-    size_t total_recreated_count;  // 累计重建次数
-
-    // 字节级累计统计（需求⑤）
-    uint64_t requested_from_os_bytes;   // 累计从OS申请的字节数
-    uint64_t returned_to_os_bytes;      // 累计归还OS的字节数
-    uint64_t allocated_to_app_bytes;    // 累计分配给应用的字节数
-    uint64_t freed_from_app_bytes;      // 累计应用释放的字节数
-    uint64_t thrash_events;             // 抖动事件数（LIVE→DETACHED→LIVE）
+    size_t segments_live;
+    size_t segments_detached;
+    size_t segments_returned;
+    size_t total_detached_count;
+    size_t total_returned_count;
+    uint64_t requested_from_os_bytes;
+    uint64_t returned_to_os_bytes;
+    uint64_t allocated_to_app_bytes;
+    uint64_t freed_from_app_bytes;
+    double fragmentation_ratio;
 };
 ```
 
@@ -1116,34 +1112,34 @@ typedef struct {
     size_t segments_returned;
     size_t total_detached_count;
     size_t total_returned_count;
-    size_t total_recreated_count;
     uint64_t requested_from_os_bytes;
     uint64_t returned_to_os_bytes;
     uint64_t allocated_to_app_bytes;
     uint64_t freed_from_app_bytes;
-    uint64_t thrash_events;
+    double   fragmentation_ratio;
 } uballoc_return_stats_t;
 ```
 
-**计算字段**
+**字段说明**
 
-| 指标 | 公式 | 含义 |
-|------|------|------|
-| 当前持有 | `requested_from_os_bytes - returned_to_os_bytes` | uballoc从OS持有的内存 |
-| 应用在用 | `allocated_to_app_bytes - freed_from_app_bytes` | 应用当前占用的内存 |
-| 效率比 | `应用在用 / 当前持有` | 高=紧凑，低=囤积 |
+| 字段 | 含义 |
+|------|------|
+| `segments_live` | 当前 LIVE 段数（正在使用） |
+| `segments_detached` | 当前 DETACHED 段数（待归还） |
+| `segments_returned` | 当前 RETURNED 段数（已归还 OS） |
+| `total_detached_count` | 累计 detach 次数 |
+| `total_returned_count` | 累计归还次数 |
+| `requested_from_os_bytes` | 累计从 OS 申请的字节数 |
+| `returned_to_os_bytes` | 累计归还 OS 的字节数 |
+| `allocated_to_app_bytes` | 累计分配给应用的字节数 |
+| `freed_from_app_bytes` | 累计应用释放的字节数 |
+| `fragmentation_ratio` | 碎片率，= `(requested - returned) / (allocated - freed)`，>1.0 表示有碎片 |
 
 **示例（C++）**
 
 ```cpp
 auto stats = uballoc::return_stats();
-uint64_t held = stats.requested_from_os_bytes - stats.returned_to_os_bytes;
-uint64_t in_use = stats.allocated_to_app_bytes - stats.freed_from_app_bytes;
-double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
-
-std::cout << "held=" << held / (1024*1024) << "MB"
-          << " in_use=" << in_use / (1024*1024) << "MB"
-          << " efficiency=" << efficiency << "%"
+std::cout << "frag_ratio=" << stats.fragmentation_ratio
           << " live=" << stats.segments_live
           << " detached=" << stats.segments_detached
           << " returned=" << stats.segments_returned
@@ -1155,16 +1151,122 @@ std::cout << "held=" << held / (1024*1024) << "MB"
 ```c
 uballoc_return_stats_t s;
 uballoc_return_stats(&s);
-uint64_t held = s.requested_from_os_bytes - s.returned_to_os_bytes;
-uint64_t in_use = s.allocated_to_app_bytes - s.freed_from_app_bytes;
-double efficiency = (held > 0) ? 100.0 * in_use / held : 0.0;
-
-printf("held=%luMB in_use=%luMB efficiency=%.1f%% live=%lu detached=%lu returned=%lu\n",
-       held / (1024*1024), in_use / (1024*1024), efficiency,
-       s.segments_live, s.segments_detached, s.segments_returned);
+printf("frag_ratio=%.2f live=%lu detached=%lu returned=%lu\n",
+       s.fragmentation_ratio, s.segments_live, s.segments_detached, s.segments_returned);
 ```
 
 > **注**：通过`UBALLOC_RECLAIM_STATS=0`可关闭字节级统计（热路径零开销）。
+
+---
+
+### uballoc_usable_size
+
+查询分配的可用大小。
+
+**C API:**
+
+```c
+size_t uballoc_usable_size(void *pointer);
+```
+
+**C++ API:**
+
+```cpp
+size_t uballoc::usable_size(void* ptr);
+```
+
+| 参数名 | 描述 | 取值范围 | 输入/输出 |
+|--------|------|---------|----------|
+| `pointer` | 由`uballoc_malloc`返回的指针 | 非空 | 输入 |
+
+返回值：分配的可用大小（≥ 请求大小，因内部碎片可能更大）。对于NULL或无法识别的指针返回0。
+
+**用途**：
+- **right-sizing**：如果`usable_size(ptr) >= new_size`，无需调用`realloc`，可直接使用多余空间
+- **碎片评估**：`usable_size`与请求大小的差异反映内部分配碎片
+
+**示例**
+
+```cpp
+void* p = uballoc::malloc(63);   // 请求63B，分配64B
+size_t us = uballoc::usable_size(p);  // us = 64
+// 如果后续需要64B，usable_size(64) >= 64，无需realloc
+uballoc::free(p);
+```
+
+---
+
+### uballoc_defrag_hints
+
+获取低占用率内存区域中的活跃分配列表，用于应用协作式碎片整理。
+
+**C API:**
+
+```c
+size_t uballoc_defrag_hints(double threshold,
+                            uballoc_defrag_hint_t *out,
+                            size_t max_hints);
+```
+
+**C++ API:**
+
+```cpp
+std::vector<uballoc::DefragHint> uballoc::defrag_hints(double threshold);
+```
+
+| 参数名 | 描述 | 取值范围 | 输入/输出 |
+|--------|------|---------|----------|
+| `threshold` | 内存区域占用率阈值 | 0.0~1.0 | 输入 |
+| `out` (C API) | 输出数组 | 非空 | 输出 |
+| `max_hints` (C API) | 输出数组容量 | >0 | 输入 |
+
+返回值：C API返回写入`out`的hint数量；C++ API返回`std::vector<DefragHint>`。
+
+**`uballoc_defrag_hint_t` / `uballoc::DefragHint` 结构体定义**
+
+```c
+typedef struct {
+    void*  ptr;        /* 需要搬迁的分配指针 */
+    size_t size;        /* 分配的可用大小 */
+    double occupancy;   /* 所在内存区域的占用率(0.0~1.0) */
+} uballoc_defrag_hint_t;
+```
+
+| 字段 | 含义 |
+|------|------|
+| `ptr` | 需要搬迁的分配指针 |
+| `size` | 分配的可用大小（等同`usable_size`的返回值） |
+| `occupancy` | 该分配所在内存区域的block占用率，0.0=全空，1.0=全满。低于`threshold`的分配才会被返回 |
+
+**碎片整理工作流（Redis activedefrag模式）**
+
+1. 调用`return_stats`查碎片率`fragmentation_ratio`
+2. 碎片率超阈值时调用`defrag_hints(0.5)`获取低占用区域的活跃分配
+3. 对每个hint执行搬迁：`malloc(size)` + `memcpy` + 修复引用 + `free(old_ptr)`
+4. 搬迁后调用`purge()`回收空内存区域，碎片率下降
+
+**示例**
+
+```cpp
+auto stats = uballoc::return_stats();
+double frag = stats.fragmentation_ratio;
+
+if (frag > 1.5) {  // 碎片率 > 1.5，启动整理
+    auto hints = uballoc::defrag_hints(0.5);  // 占用率 < 50% 的区域
+    for (auto& h : hints) {
+        void* neu = uballoc::malloc(h.size);
+        memcpy(neu, h.ptr, h.size);
+        /* 修复所有指向 h.ptr 的指针 → neu */
+        uballoc::free(h.ptr);
+    }
+    uballoc::purge();  // 回收空区域
+}
+```
+
+> **注**：
+> - 分配器不搬迁数据，因为C/C++分配器不知道指针引用关系。应用必须自行修复引用。
+> - `defrag_hints` 应在无并发分配/释放时调用（如应用主线程的维护周期），避免读取到正在被其他线程修改的内存状态。
+> - `defrag_hints` 返回的指针可能包含其他进程通过跨进程分配创建的块。应用在搬迁时需确保对跨进程引用的块进行协调（publish/unpublish）。
 
 ---
 
@@ -1182,11 +1284,11 @@ printf("held=%luMB in_use=%luMB efficiency=%.1f%% live=%lu detached=%lu returned
 
 **Huge分配的realloc特殊行为：**
 
-Huge分配的`class_size`返回`slot_count * SLAB_SIZE`（SLAB_SIZE=4MB），而非实际请求的分配大小。例如，请求5MB的Huge分配占用2个slot，`class_size`为8MB。
+Huge分配的`class_size`返回`slot_count * SLAB_SIZE`（SLAB_SIZE=2MB），而非实际请求的分配大小。例如，请求5MB的Huge分配占用3个slot，`class_size`为6MB。
 
 这意味着：
 
-- **`new_size` <= `class_size`（即使`new_size` > 原始请求大小）**：视为缩容，返回原指针。例如，原分配5MB（`class_size`=8MB），`realloc`到6MB → 6MB <= 8MB → 返回原指针，不分配新块。多余的slot空间（8MB - 6MB = 2MB）被浪费。
+- **`new_size` <= `class_size`（即使`new_size` > 原始请求大小）**：视为缩容，返回原指针。例如，原分配5MB（`class_size`=6MB），`realloc`到6MB → 6MB <= 6MB → 返回原指针，不分配新块。多余的slot空间（6MB - 6MB = 0MB）被浪费。
 
 - **`new_size` > `class_size`**：视为扩容，分配新块、拷贝数据、释放旧块，返回新指针（`!= old_ptr`）。由于旧slot在`allocate`时仍被占用（CAS已claim），新分配必然落在不同slot，因此`new_ptr != old_ptr`。
 
