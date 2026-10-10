@@ -375,6 +375,42 @@ public:
     uint32_t scan_count_since_stats_ = 0;
     uint32_t log_stats_interval_ = 30;
 
+    // Dead-peer heartbeat parameters (read from env in init_reclaim_params).
+	// Defaults: heartbeat every 5s, declare a peer dead after 30s of silence.
+    //
+    //   heartbeat_enabled_       — master on/off switch (UBALLOC_HEARTBEAT_ENABLED)
+    //   heartbeat_interval_ns_   — HeartbeatThread sleep interval; the shared
+    //                              counter is incremented once per cycle
+    //   dead_peer_timeout_ns_   — if a peer's heartbeat_seq hasn't advanced
+    //                             for this long (measured by OUR local
+    //                             clock), treat the peer as dead
+    //   wait_unreferenced_timeout_ms_ — hard timeout for wait_for_unreferenced;
+    //                             0 = no hard timeout
+    //
+    // Per-peer tracking (local, not shared — each reader uses its own clock):
+    //   last_seen_heartbeat_seq_[k].load(std::memory_order_relaxed)  — last heartbeat_seq value observed
+    //                                  from peer k
+    //   last_heartbeat_change_ns_[k].load(std::memory_order_relaxed) — local time when peer k's seq last
+    //                                  changed (0 = never observed)
+    //
+    // THREAD SAFETY: last_seen_heartbeat_seq_ and last_heartbeat_change_ns_
+    // are accessed by is_peer_heartbeat_stale (called from scan_all_segments,
+    // ReclaimThread) and all_peers_dead_or_silent (called from
+    // wait_for_unreferenced, main thread). These do not run concurrently
+    // because: (1) reset()/soft_reset() stops both ReclaimThread and
+    // HeartbeatThread before wait_for_unreferenced runs; (2) scan_all_segments
+    // holds reclaim_lock. If future changes allow concurrent access, a lock
+    // or per-element atomics will be needed.
+    bool heartbeat_enabled_ = true;
+    uint64_t heartbeat_interval_ns_ = 5'000'000'000ULL;
+    uint64_t dead_peer_timeout_ns_  = 30'000'000'000ULL;
+    uint32_t wait_unreferenced_timeout_ms_ = 0;
+    // Per-element atomics: is_peer_heartbeat_stale (scan thread) and
+    // all_peers_dead_or_silent (wait path) may read/write the same
+    // element concurrently. Using atomics avoids data race UB.
+    std::array<std::atomic<uint64_t>, MAX_PROCESSES> last_seen_heartbeat_seq_{};
+    std::array<std::atomic<uint64_t>, MAX_PROCESSES> last_heartbeat_change_ns_{};
+
     void init_reclaim_params() {
         const char* enabled = std::getenv("UBALLOC_RECLAIM_ENABLED");
         if (enabled) return_enabled_ = (std::atoi(enabled) != 0);
@@ -403,17 +439,134 @@ public:
             if (v > 0) log_stats_interval_ = static_cast<uint32_t>(v);
         }
 
+        const char* hbe = std::getenv("UBALLOC_HEARTBEAT_ENABLED");
+        if (hbe) {
+            heartbeat_enabled_ = (std::atoi(hbe) != 0);
+        }
+        const char* hbi = std::getenv("UBALLOC_HEARTBEAT_INTERVAL_MS");
+        if (hbi) {
+            int ms = std::atoi(hbi);
+            if (ms > 0) {
+                heartbeat_interval_ns_ = static_cast<uint64_t>(ms) * 1'000'000ULL;
+            } else {
+                LOG_WARN("UBALLOC_HEARTBEAT_INTERVAL_MS must be a positive integer"
+                         << " (got " << ms << "), ignoring");
+            }
+        }
+        const char* dpt = std::getenv("UBALLOC_DEAD_PEER_TIMEOUT_MS");
+        if (dpt) {
+            int ms = std::atoi(dpt);
+            if (ms > 0) {
+                dead_peer_timeout_ns_ = static_cast<uint64_t>(ms) * 1'000'000ULL;
+            } else {
+                LOG_WARN("UBALLOC_DEAD_PEER_TIMEOUT_MS must be a positive integer"
+                         << " (got " << ms << "), ignoring");
+            }
+        }
+        // Dead_peer_timeout must be > heartbeat_interval, otherwise a live
+		// peer's heartbeat gap always exceeds the timeout and the peer is
+		// periodically misdetected as dead → force-detach of its LIVE borrowed
+		// segments (SIGSEGV) + premature unlink (SIGBUS).
+        // Auto-adjust to 2× interval with a warning rather than aborting
+        // init — aborting leaves partial state (own regions created, etc.)
+        // that causes crashes in destructors.
+        if (heartbeat_enabled_ && dead_peer_timeout_ns_ <= heartbeat_interval_ns_) {
+            LOG_WARN("UBALLOC_DEAD_PEER_TIMEOUT_MS (" << (dead_peer_timeout_ns_ / 1000000)
+                     << "ms) must be > UBALLOC_HEARTBEAT_INTERVAL_MS ("
+                     << (heartbeat_interval_ns_ / 1000000)
+                     << "ms) — auto-adjusting timeout to 2× interval ("
+                     << (heartbeat_interval_ns_ * 2 / 1000000) << "ms)");
+            dead_peer_timeout_ns_ = heartbeat_interval_ns_ * 2;
+        }
+        const char* wut = std::getenv("UBALLOC_WAIT_UNREFERENCED_TIMEOUT_MS");
+        if (wut) {
+            int ms = std::atoi(wut);
+            if (ms >= 0) wait_unreferenced_timeout_ms_ = static_cast<uint32_t>(ms);
+        }
+
         LOG_INFO("init_reclaim_params: enabled=" << return_enabled_
                  << " decay1_ns=" << decay1_ns_
                  << " decay2_ns=" << decay2_ns_
                  << " stats=" << uballoc::reclaim_stats_enabled().load()
-                 << " log_stats_interval=" << log_stats_interval_);
+                 << " log_stats_interval=" << log_stats_interval_
+                 << " heartbeat_enabled=" << heartbeat_enabled_
+                 << " heartbeat_interval_ns=" << heartbeat_interval_ns_
+                 << " dead_peer_timeout_ns=" << dead_peer_timeout_ns_
+                 << " wait_unreferenced_timeout_ms=" << wait_unreferenced_timeout_ms_);
     }
 
     static uint64_t steady_now_ns() {
         auto tp = std::chrono::steady_clock::now().time_since_epoch();
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(tp).count());
+    }
+
+    // Write this process's heartbeat — increment the shared counter in our
+	// bootstrap slot. Called by HeartbeatThread (every heartbeat_interval_ns_)
+	// and once from init() for immediate visibility.
+    //
+    // Writes a monotonic COUNTER (not a timestamp) — see the comment on
+    // BootstrapSlot::heartbeat_seq for why cross-node timestamp comparison
+    // is incorrect. Readers detect staleness by observing the counter stop
+    // advancing, measured with the READER's own local clock. This makes
+    // the mechanism correct across nodes with different CLOCK_MONOTONIC
+    // epochs.
+    //
+    // flush+fence ensures cache-coherence on non-coherent devices (UBSE),
+    // matching the discipline used by set_slot_ready and bootstrap writes.
+    void write_heartbeat() {
+        if (!bootstrap_block_ || rank_ < 0) return;
+        if (!heartbeat_enabled_) return;
+        bootstrap_block_->slots[rank_].heartbeat_seq
+            .fetch_add(1, std::memory_order_release);
+        flush(&bootstrap_block_->slots[rank_].heartbeat_seq, Invalidate::No);
+        fence();
+    }
+
+    // Return true if peer_rank's heartbeat is stale.
+    //
+    // Uses a counter-based approach: the reader tracks the last-seen
+    // counter value for each peer and the local time when it last
+    // changed. If the counter hasn't advanced within dead_peer_timeout_ns
+    // (measured by the READER's own clock), the peer is declared dead.
+    //
+    // This is correct across nodes because it never compares timestamps
+    // across machines — it only checks "has the counter stopped
+    // advancing?" using the reader's local clock to measure elapsed time.
+    //
+    // A peer that has claimed a slot but never written a heartbeat
+    // (seq==0) is NOT considered stale — it may have just joined. The
+    // existing kill(pid,0) join-time path (claim_rank) handles dead
+    // processes that never wrote a heartbeat.
+    bool is_peer_heartbeat_stale(int peer_rank, uint64_t now_ns) {
+        if (!bootstrap_block_ || peer_rank < 0 ||
+            peer_rank >= static_cast<int>(MAX_PROCESSES)) return false;
+        int32_t pid = bootstrap_block_->slots[peer_rank].pid.load(
+            std::memory_order_acquire);
+        if (pid == 0) return false;  // slot empty — no peer there
+        uint64_t seq = bootstrap_block_->slots[peer_rank].heartbeat_seq.load(
+            std::memory_order_acquire);
+        if (seq == 0) return false;  // peer hasn't written yet — give grace
+
+        if (seq != last_seen_heartbeat_seq_[peer_rank].load(std::memory_order_relaxed)) {
+            // Counter advanced — peer is alive. Record the new value and
+            // the local time we observed the change.
+            last_seen_heartbeat_seq_[peer_rank].store(seq, std::memory_order_relaxed);
+            last_heartbeat_change_ns_[peer_rank].store(now_ns, std::memory_order_relaxed);
+            return false;
+        }
+        // Counter unchanged since last observation. Check how long it
+        // has been stagnant (using OUR local clock — no cross-node
+        // timestamp comparison).
+        uint64_t last_change = last_heartbeat_change_ns_[peer_rank].load(std::memory_order_relaxed);
+        if (last_change == 0) {
+            // First observation of this peer (seq != 0 but we never
+            // recorded it). Record now; don't declare stale yet.
+            last_seen_heartbeat_seq_[peer_rank].store(seq, std::memory_order_relaxed);
+            last_heartbeat_change_ns_[peer_rank].store(now_ns, std::memory_order_relaxed);
+            return false;
+        }
+        return (now_ns - last_change) > dead_peer_timeout_ns_;
     }
 
     DistributedShmBackend() {
@@ -699,6 +852,10 @@ public:
                     bootstrap_block_->slots[i].ready.store(0, std::memory_order_relaxed);
                     bootstrap_block_->slots[i].node_slot_id.store(0, std::memory_order_relaxed);
                     bootstrap_block_->slots[i].node_index.store(UINT32_MAX, std::memory_order_relaxed);
+                    // Clear the dead process's stale heartbeat so peers don't
+					// immediately mis-detect us as dead based on its timestamp.
+					// Our first write_heartbeat() will publish a fresh value.
+                    bootstrap_block_->slots[i].heartbeat_seq.store(0, std::memory_order_relaxed);
                     last_seen_generation_[i] = gen + 1;
                     LOG_INFO("claim_rank: reclaimed slot " << i << " pid=" << my_pid << " gen=" << (gen + 1));
                     return i;
@@ -948,6 +1105,9 @@ public:
             bootstrap_block_->slots[rank_].pid.compare_exchange_strong(
                 expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
             bootstrap_block_->slots[rank_].ready.store(0, std::memory_order_release);
+            // Clear heartbeat on exit so peers waiting on us don't keep
+			// treating us as a fresh-heartbeat peer.
+            bootstrap_block_->slots[rank_].heartbeat_seq.store(0, std::memory_order_release);
             LOG_INFO("clear_bootstrap_slot: cleared slot " << rank_);
         }
     }
@@ -1066,6 +1226,8 @@ public:
                 dir->descs[seg_idx].name[63] = '\0';
                 dir->descs[seg_idx].total_size = seg_size;
                 dir->descs[seg_idx].slab_count = requested_slabs;
+                // Compute CRC before publishing.
+                dir->descs[seg_idx].crc32 = dir->descs[seg_idx].compute_checksum();
                 dir->descs[seg_idx].ready.store(1, std::memory_order_release);
             }
         }
@@ -1324,6 +1486,9 @@ public:
 
     void return_segment_purge() {
         if (rank_ < 0) return;
+        // Only Small/Large brackets have SegmentHeader (live_slab_count).
+        // Huge bracket (b==2) has a different memory layout — accessing
+        // it as SegmentHeader is UB/SIGSEGV.
         for (int b = 0; b < 2; ++b) {
             for (size_t s = 0; s < segments_[rank_][b].size(); ++s) {
                 auto& entry = segments_[rank_][b][s];
@@ -1369,6 +1534,8 @@ public:
         uint64_t now = actions.now;
 
         // Phase 1+2: own segments LIVE→DETACHED (decay1) / DETACHED→RETURNED (decay2)
+        // Only Small/Large brackets have SegmentHeader (live_slab_count).
+        // Huge bracket (b==2) has a different memory layout.
         for (int b = 0; b < 2; ++b) {
             auto& segs = segments_[rank_][b];
             for (size_t idx = 0; idx < segs.size(); ++idx) {
@@ -1390,11 +1557,55 @@ public:
             }
         }
 
+        // Phase 3a: stale-peer borrow cleanup.
+        // For each peer whose heartbeat is stale, collect every LIVE
+        // segment we are borrowing from it into borrower_detach. The
+        // execute loop munmaps + closes our fd + marks DETACHED, which
+        // releases our local resources (VA + fd). On UBSE,
+        // detach_with_refcount also releases the node-level borrow,
+        // which unblocks the dead lender's wait_for_unreferenced.
+        //
+        // Phase 3a runs BEFORE Phase 3b so that segments we collect
+        // here are skipped by Phase 3b's `seg.state == LIVE` check on
+        // the same scan iteration (Phase 3b would have skipped them
+        // anyway since the execute loop sets state=DETACHED, but
+        // running 3a first means the action list isn't duplicated).
+        for (int k = 0; k < total_processes_; ++k) {
+            if (k == rank_) continue;
+            if (!is_peer_heartbeat_stale(k, now)) continue;
+            // Same-node peers: double-check with kill(pid,0) before
+            // force-detaching. This avoids false positives from SIGSTOP
+            // or scheduler stalls on same-node deployments where
+            // kill(pid,0) is reliable. Cross-node peers (UBSE) cannot
+            // be kill-checked (ESRCH for all cross-node PIDs), so they
+            // rely on heartbeat-stale alone.
+            int32_t peer_pid = bootstrap_block_->slots[k].pid.load(
+                std::memory_order_acquire);
+            if (peer_pid != 0 && peer_pid != static_cast<int32_t>(::getpid())) {
+                if (::kill(peer_pid, 0) == 0 || errno != ESRCH) {
+                    // Peer is alive (same node) — skip despite stale heartbeat.
+                    // Could be SIGSTOP, scheduler stall, or transient.
+                    continue;
+                }
+            }
+            LOG_WARN("scan_all_segments: P" << k
+                     << " heartbeat stale — force-detaching its borrows");
+            for (int b = 0; b < DATA_BRACKETS; ++b) {
+                int avail = static_cast<int>(segments_[k][b].size());
+                for (int s = 0; s < avail; ++s) {
+                    auto& seg = segments_[k][b][s];
+                    if (seg.state == SegmentEntry::State::LIVE) {
+                        actions.borrower_detach.push_back({k, b, s});
+                    }
+                }
+            }
+        }
+
         // Phase 3: borrower-side cleanup — collect remote segments whose
         // lender has detached (ready==0).
         for (int k = 0; k < total_processes_; ++k) {
             if (k == rank_) continue;
-            for (int b = 0; b < 2; ++b) {
+            for (int b = 0; b < DATA_BRACKETS; ++b) {
                 SegmentDirectory* dir = segment_directory(k, b);
                 if (!dir) continue;
                 int avail = static_cast<int>(segments_[k][b].size());
@@ -1526,6 +1737,7 @@ public:
         if (!return_enabled_ || rank_ < 0) return UINT64_MAX;
         uint64_t earliest = UINT64_MAX;
 
+        // Only Small/Large brackets have SegmentHeader (live_slab_count).
         for (int b = 0; b < 2; ++b) {
             const auto& segs = segments_[rank_][b];
             for (const auto& entry : segs) {
@@ -1585,6 +1797,17 @@ public:
 
         size_t seg_size = dir->descs[seg_idx].total_size;
         if (seg_size == 0) return Error(ErrorKind::Shm, "segment size is 0");
+
+        // Verify CRC after ready==1 (caller checked). If mismatch,
+		// treat as not-ready (torn write / corruption).
+        uint32_t stored_crc = dir->descs[seg_idx].crc32;
+        uint32_t actual_crc = dir->descs[seg_idx].compute_checksum();
+        if (stored_crc != actual_crc) {
+            LOG_ERROR("attach_data_segment: P" << remote_pid << " seg=" << seg_idx
+                     << " CRC mismatch (stored=0x" << std::hex << stored_crc
+                     << " actual=0x" << actual_crc << std::dec << ") — skipping");
+            return Error(ErrorKind::Shm, "segment descriptor CRC mismatch");
+        }
 
         size_t effective_size = round_up_shm_size(seg_size);
         std::string name = ShmProviderT::shm_name(heap_id_, remote_pid, static_cast<int>(rt), seg_idx);
@@ -2407,16 +2630,98 @@ public:
         g_uffd_attached.clear();
     }
 
+    // Returns true if every non-self rank with a
+    // claimed slot has a stale heartbeat (or no heartbeat at all). Used
+    // by wait_for_unreferenced to decide whether the daemon's
+    // "still referenced" report is from a live borrower (keep waiting)
+    // or a dead borrower (proceed — it will never release).
+    bool all_peers_dead_or_silent(uint64_t now_ns) {
+        if (!bootstrap_block_) return false;
+        for (int k = 0; k < static_cast<int>(MAX_PROCESSES); ++k) {
+            if (k == rank_) continue;
+            int32_t pid = bootstrap_block_->slots[k].pid.load(
+                std::memory_order_acquire);
+            if (pid == 0) continue;  // empty slot — not a peer
+            uint64_t seq = bootstrap_block_->slots[k].heartbeat_seq.load(
+                std::memory_order_acquire);
+            if (seq == 0) {
+                // Peer hasn't published a heartbeat. This happens when
+                // heartbeat is disabled (UBALLOC_HEARTBEAT_ENABLED=0)
+                // or the peer just joined but hasn't written yet.
+                //
+                // Fall back to kill(pid,0) ONLY for same-node peers.
+                // kill(pid,0) is reliable for same-node processes but
+                // returns ESRCH for ALL cross-node PIDs (alive or dead)
+                // — using it on cross-node peers would falsely declare
+                // them dead. Distinguish via node_index: if the peer's
+                // node_index differs from ours, we cannot kill-check it
+                // and must conservatively treat it as alive (return false).
+                uint32_t peer_node_idx = bootstrap_block_->slots[k].node_index
+                    .load(std::memory_order_acquire);
+                bool same_node = (peer_node_idx == my_node_index_);
+                if constexpr (ShmProviderT::is_single_node) {
+                    same_node = true;  // POSIX: all processes are same-node
+                }
+                if (same_node && pid != 0 &&
+                    pid != static_cast<int32_t>(::getpid())) {
+                    if (::kill(pid, 0) == -1 && errno == ESRCH) {
+                        // Same-node peer process is dead — skip it.
+                        continue;
+                    }
+                }
+                // Cross-node peer or kill says alive — conservatively
+                // treat as alive (keep waiting).
+                return false;
+            }
+            if (seq != last_seen_heartbeat_seq_[k].load(std::memory_order_relaxed)) {
+                // Counter advanced — peer is alive
+                last_seen_heartbeat_seq_[k].store(seq, std::memory_order_relaxed);
+                last_heartbeat_change_ns_[k].store(now_ns, std::memory_order_relaxed);
+                return false;
+            }
+            // Counter unchanged — check if stagnant beyond timeout
+            uint64_t last_change = last_heartbeat_change_ns_[k].load(std::memory_order_relaxed);
+            if (last_change == 0) {
+                // First observation — record and give grace
+                last_seen_heartbeat_seq_[k].store(seq, std::memory_order_relaxed);
+                last_heartbeat_change_ns_[k].store(now_ns, std::memory_order_relaxed);
+                return false;
+            }
+            if ((now_ns - last_change) <= dead_peer_timeout_ns_) return false;
+        }
+        return true;  // no fresh-heartbeat peer found
+    }
+
     void wait_for_unreferenced() {
         if constexpr (ShmProviderT::has_reliable_unreferenced_check) {
-            // No timeout: wait indefinitely for other nodes to release
-            // their borrows. If a remote process crashes, this process
-            // hangs (expected behavior — user kills it, cleanup_all_
-            // distributed_shms handles stale shms). A timeout would
-            // cause premature exit → leftover shms when all processes
-            // exit successfully.
+            // Per-poll, check the heartbeat of every peer rank. If all peer
+			// slots have stale heartbeats, any "still referenced" report from
+			// the daemon is from a dead borrower that will never release —
+			// proceed past (the residue — orphaned import + lingering
+			// shm name + physical memory — is handled by the daemon's GC and
+			// the external cleanup_shms_ub.sh script). A hard
+            // timeout (UBALLOC_WAIT_UNREFERENCED_TIMEOUT_MS, default 0
+            // = disabled) provides a backstop independent of heartbeats.
             auto wait_one = [&](const std::string& name) {
-                while (!ShmProviderT::shm_is_unreferenced(name)) {
+                uint64_t deadline_ns = 0;
+                if (wait_unreferenced_timeout_ms_ > 0) {
+                    deadline_ns = steady_now_ns() +
+                        static_cast<uint64_t>(wait_unreferenced_timeout_ms_) * 1'000'000ULL;
+                }
+                while (true) {
+                    if (ShmProviderT::shm_is_unreferenced(name)) return;
+                    uint64_t now = steady_now_ns();
+                    if (all_peers_dead_or_silent(now)) {
+                        LOG_WARN("wait_for_unreferenced: " << name
+                                 << " still referenced but all peers dead/silent — proceeding");
+                        return;
+                    }
+                    if (deadline_ns != 0 && now >= deadline_ns) {
+                        LOG_WARN("wait_for_unreferenced: " << name
+                                 << " hard timeout " << wait_unreferenced_timeout_ms_
+                                 << "ms reached — proceeding");
+                        return;
+                    }
                     ::usleep(1000);
                 }
             };

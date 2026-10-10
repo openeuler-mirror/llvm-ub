@@ -5,6 +5,9 @@ set(UBALLOC_UNIT_TEST_TARGETS
     test_huge_cross_free
     test_multi_proc_per_node
     test_reclaim
+    test_heartbeat
+    test_checksum
+    test_recover_state
     test_size_routing
     test_introspection
     test_defrag_hints

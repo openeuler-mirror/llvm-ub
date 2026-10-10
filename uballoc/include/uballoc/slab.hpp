@@ -319,25 +319,58 @@ template<typename B>
 struct SlabStackGlobal {
     Detectable<std::optional<SlabIndex<B>>> head;
 
-    void push([[maybe_unused]] ThreadId id, Slab<B>& slabs, SlabIndex<B> head_idx, SlabIndex<B> tail_idx) {
-        uint64_t old_raw;
-        uint64_t desired_raw;
-        do {
-            old_raw = head.raw_.load(std::memory_order_acquire);
+    // Route through update_distributed for do_help + per-thread version.
+	// The raw CAS loop is replaced with update_distributed which handles
+	// version bumping, observer feeding, and the CAS itself.
+	// The lambda captures `slabs` and the indices to perform the side effects
+	// (next pointer update) that must happen inside the CAS retry loop
+	// (between reading old head and CASing new).
+    void push(ThreadId id, Slab<B>& slabs, SlabIndex<B> head_idx, SlabIndex<B> tail_idx,
+              DistributedHelpArray* help) {
+        Version ver = Version();
+        if (help) {
+            Version current = help->load(id, id);
+            ver = current.next();
+            help->store(id, id, ver);
+        }
+
+        while (true) {
+            uint64_t old_raw = head.raw_.load(std::memory_order_acquire);
             auto old_state = CasState<std::optional<SlabIndex<B>>>::unpack(old_raw);
 
+            // do_help: record observation for recovery
+            if (help && old_state.id) {
+                help->store(id, *old_state.id, old_state.version);
+            }
+
+            // Side effect: link tail's next to old head
             uint32_t next_val = old_state.inner ? old_state.inner->internal() : 0;
             slabs.local(tail_idx).next.store(next_val, std::memory_order_relaxed);
             flush(&slabs.local(tail_idx).next, Invalidate::No);
 
-            uint16_t new_version = old_state.version.value_ + 1;
-            CasState<std::optional<SlabIndex<B>>> desired{id, Version(new_version), std::optional<SlabIndex<B>>(head_idx)};
-            desired_raw = CasState<std::optional<SlabIndex<B>>>::pack(desired);
-        } while (!head.raw_.compare_exchange_weak(old_raw, desired_raw,
-                 std::memory_order_acq_rel, std::memory_order_relaxed));
+            CasState<std::optional<SlabIndex<B>>> desired{
+                std::optional<ThreadId>(id), ver,
+                std::optional<SlabIndex<B>>(head_idx)};
+            uint64_t desired_raw = CasState<std::optional<SlabIndex<B>>>::pack(desired);
+
+            if (head.raw_.compare_exchange_weak(old_raw, desired_raw,
+                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                flush(&head.raw_, Invalidate::No);
+                fence();
+                return;
+            }
+        }
     }
 
-    std::optional<SlabIndex<B>> pop([[maybe_unused]] ThreadId id, Slab<B>& slabs) {
+    std::optional<SlabIndex<B>> pop(ThreadId id, Slab<B>& slabs,
+                                    DistributedHelpArray* help) {
+        Version ver = Version();
+        if (help) {
+            Version current = help->load(id, id);
+            ver = current.next();
+            help->store(id, id, ver);
+        }
+
         while (true) {
             uint64_t old_raw;
             uint64_t new_raw;
@@ -349,16 +382,24 @@ struct SlabStackGlobal {
 
                 if (!old_state.inner) return std::nullopt;
 
+                // do_help: record observation for recovery
+                if (help && old_state.id) {
+                    help->store(id, *old_state.id, old_state.version);
+                }
+
                 idx = *old_state.inner;
                 uint32_t next = slabs.local(idx).next.load(std::memory_order_relaxed);
                 std::optional<SlabIndex<B>> new_inner = (next > 0) ?
                     std::optional<SlabIndex<B>>(SlabIndex<B>::unpack(next)) : std::nullopt;
 
-                uint16_t new_version = old_state.version.value_ + 1;
-                CasState<std::optional<SlabIndex<B>>> desired{id, Version(new_version), new_inner};
+                CasState<std::optional<SlabIndex<B>>> desired{
+                    std::optional<ThreadId>(id), ver, new_inner};
                 new_raw = CasState<std::optional<SlabIndex<B>>>::pack(desired);
             } while (!head.raw_.compare_exchange_weak(old_raw, new_raw,
                      std::memory_order_acq_rel, std::memory_order_relaxed));
+
+            flush(&head.raw_, Invalidate::No);
+            fence();
 
             if (slabs.local(idx).detached.load(std::memory_order_relaxed) == 0) {
                 return idx;

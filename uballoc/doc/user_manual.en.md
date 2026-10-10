@@ -31,6 +31,7 @@ Applicable scenarios: allocation, free, publish, discovery, and cross-node acces
 | Defragmentation | `uballoc::usable_size(ptr)` returns the usable size of an allocation (for right-sizing to avoid unnecessary reallocs); `uballoc::defrag_hints(threshold)` returns live allocations in low-occupancy memory regions; the application performs malloc+memcpy+fixrefs+free for cooperative defragmentation. |
 | CRTP zero-overhead backend | The backend dispatches statically via CRTP — no virtual calls on the allocation hot path. ARMv8.1 LSE atomics are optional, compile-time toggleable. |
 | Crash recovery | Three optional mechanisms — detectable CAS, state logging, cache flushing — support post-crack scan-and-rebuild of allocator state. |
+| Dead-peer heartbeat detection | An independent background thread periodically increments a heartbeat counter in the process's bootstrap slot (default interval 5s). When a peer's counter stops advancing for longer than `UBALLOC_DEAD_PEER_TIMEOUT_MS` (default 30s), it is declared dead: its borrowed segments are force-released, and `wait_for_unreferenced` no longer hangs forever. Disable via `UBALLOC_HEARTBEAT_ENABLED=0`. See [Dead-Peer Heartbeat Detection](#dead-peer-heartbeat-detection). |
 
 ## Installation
 
@@ -346,6 +347,12 @@ As shown in [**Table 3** uballoc environment variables](#uballoc-environment-var
 | `UBALLOC_RECLAIM_SCAN_INTERVAL_MS` | ASYNC mode background thread scan interval (ms) | `5000` | any positive integer |
 | `UBALLOC_RECLAIM_STATS` | Memory statistics switch; set to 0 to disable hot-path byte counting (zero overhead) | `1` | `0`/`1` |
 | `UBALLOC_RECLAIM_LOG_STATS_INTERVAL` | ASYNC mode `[RECLAIM-STATS]` log interval (emit every N background scans) | `30` | any positive integer |
+| `UBALLOC_HEARTBEAT_ENABLED` | Heartbeat master switch; set to `0` to disable heartbeat writes and dead-peer detection (peer detection falls back to `kill(pid,0)` check). | `1` | `0`/`1` |
+| `UBALLOC_HEARTBEAT_INTERVAL_MS` | Heartbeat counter increment interval (ms). An independent background thread increments a heartbeat counter in the bootstrap slot at this interval for peer liveness detection. Must be less than `UBALLOC_DEAD_PEER_TIMEOUT_MS`, otherwise auto-adjusted to 2× interval. | `5000` | any positive integer |
+| `UBALLOC_DEAD_PEER_TIMEOUT_MS` | Peer death threshold (ms). When a peer's heartbeat counter stops advancing for longer than this, the peer is declared dead: its borrowed segments are force-released, and `wait_for_unreferenced` proceeds after all peers are dead. Must be greater than `UBALLOC_HEARTBEAT_INTERVAL_MS`. | `30000` | any positive integer |
+| `UBALLOC_WAIT_UNREFERENCED_TIMEOUT_MS` | Hard timeout for `wait_for_unreferenced` (ms), independent of heartbeat detection. `0` (default) means no hard timeout — relies on heartbeat detection alone. When set to a positive value, the wait proceeds after the timeout regardless of peer state, as a backstop. | `0` | any non-negative integer |
+
+> **CRC verification timeout**: When P1 waits for P0's metadata, it first waits for `ready_flag` (up to 30s), then verifies CRC (up to 30s retry). If either phase times out, P1 aborts initialization (`init()` returns failure). The original behavior was to wait forever.
 
 ### Environment-variable configuration example
 
@@ -1406,14 +1413,15 @@ Note: This pattern does not cover the `shm_delete` scenario. If the consumer mod
 
 - `publish()` / `lookup_by_type_blocking()` — data discovery and synchronization.
 - After the publisher enters cleanup, the consumer can still discover its data (the bootstrap slot stays `ready=1` during `wait_for_unreferenced`).
-- `wait_for_unreferenced()` waits indefinitely for other nodes to release borrows — when all processes exit normally, shms are cleaned up automatically, no residue.
+- `wait_for_unreferenced()` proceeds after all peers are dead/silent (heartbeat stale) or a hard timeout — no longer hangs forever. Normal-exit scenarios still clean up shms automatically with no residue.
+- Dead-peer detection: force-releases a dead peer's borrowed segments (munmap + close fd + mark DETACHED).
 - `check_remote_segments()` — explicit (non-lazy) attach of remote segments (thread-safe; concurrent calls from multiple threads do not double-attach).
 
 ### What the Library Cannot Provide
 
 - Knowing when other processes have "finished accessing" your data (requires application-level coordination).
 - Preventing cross-node mapping invalidation on process exit (UBSE device behavior).
-- Automatic recovery after a remote process crashes — the local process will wait indefinitely (hang), requiring manual kill + cleanup scripts to clear residual shms.
+- Physical memory reclamation after a cross-node borrower crash — the local `wait_for_unreferenced` can unblock and unlink names after the heartbeat expires, but the physical memory requires UBSE daemon GC (import lease / force-expire) or the `cleanup_shms_ub.sh` script to reclaim.
 
 ### Cleaning Up Residual Shared Memory
 
@@ -1485,6 +1493,22 @@ The above results are for reference only; actual results may vary.
 ### Do fork children start a background reclaim thread?
 
 No. Fork children's `init()` detects PID change and skips ReclaimThread creation. Fork children are typically short-lived (alloc+free then `_exit`), so background reclaim is unnecessary. If needed, fork children can use SYNC mode or `purge()`.
+
+---
+
+## Dead-Peer Heartbeat Detection
+
+### Overview
+
+When a remote process crashes without releasing its shared-memory borrows, the local process's `wait_for_unreferenced()` hangs forever. The dead-peer heartbeat detection mechanism converts this "hang forever" into "auto-unblock in bounded time."
+
+Each process periodically increments a heartbeat counter in its bootstrap slot. Other processes detect a peer as dead by observing the counter stop advancing — if the counter hasn't incremented within `UBALLOC_DEAD_PEER_TIMEOUT_MS`, the peer is declared dead, its borrowed segments are force-released, and `wait_for_unreferenced` no longer hangs.
+
+> **Note**: A counter is used (not a timestamp) because `CLOCK_MONOTONIC` epochs are machine-local — two nodes with different uptimes produce incomparable timestamps, which would cause live cross-node peers to be misdetected as dead. With a counter, the reader uses its own local clock to measure "how long since the counter last changed" — no cross-node timestamp comparison.
+
+> **Residual scenario**: The heartbeat-based unblock in `wait_for_unreferenced` only takes effect when all peers are dead/silent. If another resident process in the cluster has a live heartbeat, `wait_for_unreferenced` will continue waiting even if the residual reference is from a crashed cross-node borrower. In this scenario, set `UBALLOC_WAIT_UNREFERENCED_TIMEOUT_MS` as a hard-timeout backstop, or rely on UBSE daemon's import lease expiry mechanism.
+
+> **Process suspend risk**: If a process is suspended via `SIGSTOP` (e.g., debugger attach, `Ctrl+Z`), the heartbeat thread is also suspended and the process may be misdetected as dead, causing its borrowed segments to be force-reclaimed. Avoid using `SIGSTOP` on uballoc processes in production.
 
 ---
 

@@ -14,6 +14,7 @@
 - **分布式共享内存**：固定虚址 mmap，跨进程分配/释放，跨节点发布/查找
 - **节点内多进程**：按节点引用计数，`claim_rank` 死槽位检测，`node_index` CAS 分配
 - **空闲内存回收**：空闲段经历 LIVE→DETACHED→RETURNED 状态流转，归还至 UBSE 池供跨节点复用
+- **死节点心跳检测**：独立后台线程周期递增心跳计数器至 bootstrap 槽位；peer 计数器停止推进时自动强制释放其借用段，`wait_for_unreferenced` 不再永久挂起（可通过 `UBALLOC_HEARTBEAT_ENABLED=0` 关闭）
 - **内省与碎片整理**：`return_stats` 提供 per-slab 占用率、Huge slot 统计、空段检测；`defrag_hints` 返回低占用 slab 中的活跃分配列表，供应用协作式碎片整理
 - **延迟挂接**：基于 userfaultfd 的远端数据按需挂接
 - **CRTP 后端**：分配路径中无虚函数调用

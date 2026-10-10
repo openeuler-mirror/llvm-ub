@@ -41,7 +41,8 @@ struct RecoverState {
     }
     
     void store_large(uint8_t disc, uint64_t data) {
-        uint64_t raw = (static_cast<uint64_t>(disc) << 56) | (data & ((1ULL << 56) - 1)) | (2ULL << 56);
+        uint8_t large_disc = (disc & 0x0F) | 0x20;  // Replace high nibble with 0x20 for Large
+        uint64_t raw = (static_cast<uint64_t>(large_disc) << 56) | (data & ((1ULL << 56) - 1));
         state_raw.store(raw, std::memory_order_relaxed);
         flush(&state_raw, Invalidate::No);
         fence();
@@ -232,10 +233,13 @@ void recover_heap_global_to_unsized(ThreadId id, Heap<B>& heap,
     auto& unsized = heap.owned->unsized;
     
     if (heap.shared->free.head.detect(id, version, help)) {
+        // CAS landed — slab was popped from global but may not have
+        // been pushed to unsized yet. Complete the follow-up.
+        unsized.recover_push(*heap.slabs, index);
         return;
     }
     
-    unsized.recover_push(*heap.slabs, index);
+    // CAS didn't land — slab is still on the global stack. Nothing to do.
 }
 
 template<typename B>
@@ -245,10 +249,13 @@ void recover_heap_global_to_unsized_distributed(ThreadId id, Heap<B>& heap,
     auto& unsized = heap.owned->unsized;
 
     if (heap.shared->free.head.detect_distributed(id, version, help)) {
+        // CAS landed — slab was popped from global but may not have
+        // been pushed to unsized yet. Complete the follow-up.
+        unsized.recover_push(*heap.slabs, index);
         return;
     }
 
-    unsized.recover_push(*heap.slabs, index);
+    // CAS didn't land — slab is still on the global stack. Nothing to do.
 }
 
 template<typename B>

@@ -16,6 +16,7 @@
 #include "published.hpp"
 #include "segment.hpp"
 #include "log.hpp"
+#include "crc32.hpp"
 
 namespace uballoc {
 
@@ -25,7 +26,7 @@ inline size_t align_up(size_t val, size_t align) {
 
 struct SharedLayout {
     static constexpr uint64_t MAGIC = 0x55BA110C00001ULL;
-    static constexpr uint32_t LAYOUT_VERSION = 7;
+    static constexpr uint32_t LAYOUT_VERSION = 8;
 
     uint64_t magic;
     uint32_t layout_version;
@@ -48,7 +49,24 @@ struct SharedLayout {
     size_t seg_dir_large_offset;
     size_t seg_dir_huge_offset;
 
+    // CRC32 of all fields from `magic` through `seg_dir_huge_offset`
+    // (i.e., bytes [0, offsetof(crc32))). Written AFTER all data fields are
+	// set, BEFORE ready_flag.store(1). Readers verify it AFTER acquiring on
+	// ready_flag==1. Detects torn writes that the ready_flag protocol alone
+	// cannot see (discipline decay, post-publish corruption, version/shape
+	// mismatch). Excluded from the CRC span: this field itself, and ready_flag.
+    uint32_t crc32;
+
     std::atomic<uint32_t> ready_flag;
+
+    // Compute the CRC over the immutable fields. Called by the writer
+    // (init) after all fields are set, and by the reader (wire_up_process)
+    // after ready_flag==1 acquire. The CRC span is bytes [0, offsetof(crc32))
+    // — all contiguous immutable-when-written fields from magic through
+    // seg_dir_huge_offset, excluding the crc32 field itself and ready_flag.
+    uint32_t compute_checksum() const {
+        return compute_crc32(this, offsetof(SharedLayout, crc32));
+    }
 };
 
 struct DistributedSharedRegionLayout {

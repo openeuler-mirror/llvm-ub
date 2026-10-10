@@ -25,6 +25,7 @@
 #include "uffd_handler.hpp"
 #include "reclaim_mode.hpp"
 #include "reclaim_thread.hpp"
+#include "heartbeat_thread.hpp"
 
 namespace uballoc {
 
@@ -77,6 +78,9 @@ private:
 
     std::unique_ptr<ReclaimThread> reclaim_thread_;
     pid_t reclaim_creator_pid_ = 0;
+
+    std::unique_ptr<HeartbeatThread> heartbeat_thread_;
+    pid_t heartbeat_creator_pid_ = 0;
 
     static std::atomic<uint16_t> g_next_thread_id_;
 
@@ -308,8 +312,18 @@ public:
                 if (dir) dir->init();
             }
 
+            // Compute and store CRC over all immutable
+            // fields (magic..seg_dir_huge_offset) BEFORE the ready_flag
+            // publish store. Readers acquire on ready_flag and then
+            // recompute the CRC to verify no torn write occurred.
+            layout->crc32 = layout->compute_checksum();
+
             layout->ready_flag.store(1, std::memory_order_release);
-            flush(&layout->magic, Invalidate::No);
+            // Flush the entire SharedLayout (not just magic) to ensure
+            // all offset fields + crc32 + ready_flag are visible to UBSE
+            // non-coherent device memory readers. flush() iterates in
+            // cache-line increments, covering the full struct.
+            flush(layout, Invalidate::No);
             fence();
         }
 
@@ -335,8 +349,21 @@ public:
         }
 
         wire_up_process(rank);
+        // If wire_up_process(rank) failed (CRC mismatch on self metadata),
+        // it returns without setting up pointers. Abort init cleanly.
+        if (small_shared_ptrs_[rank] == nullptr) {
+            LOG_ERROR("init: wire_up_process(rank) failed — aborting init");
+            return;
+        }
         if (rank != 0) {
             wire_up_process(0);
+            // If wire_up_process(0) failed (CRC mismatch / ready_flag
+            // timeout), it returns without setting up P0's pointers.
+            // Abort init cleanly — caller checks is_initialized().
+            if (small_shared_ptrs_[0] == nullptr) {
+                LOG_ERROR("init: wire_up_process(0) failed — aborting init");
+                return;
+            }
         }
 
         distributed_shared_ptrs_[rank]->init_help(
@@ -369,6 +396,14 @@ public:
         reclaim_trigger_fn().store(&GlobalAllocator<BackendT>::reclaim_trigger_static,
                                    std::memory_order_release);
         backend_.init_reclaim_params();
+
+        // Publish an initial heartbeat immediately after init_reclaim_params
+		// (which configures the interval). This makes us visible to peers
+		// without waiting for the first scan cycle, and ensures tests with
+		// short timeouts can detect a live process on the first poll.
+		// Subsequent writes are rate-limited by heartbeat_interval_ns_ in
+		//  write_heartbeat().
+        backend_.write_heartbeat();
 
         {
             auto* reg = published_registry_ptrs_[rank];
@@ -475,6 +510,20 @@ public:
             }
             reclaim_thread_->start(scan_ms);
         }
+
+        // Start independent HeartbeatThread.
+        {
+            bool hb_fork_child = (heartbeat_creator_pid_ != 0 &&
+                                  ::getpid() != heartbeat_creator_pid_);
+            heartbeat_creator_pid_ = ::getpid();
+            if (backend_.heartbeat_enabled_ && !hb_fork_child) {
+                heartbeat_thread_ = std::make_unique<HeartbeatThread>();
+                heartbeat_thread_->set_write_fn(
+                    &GlobalAllocator<BackendT>::write_heartbeat_static);
+                heartbeat_thread_->start(
+                    backend_.heartbeat_interval_ns_ / 1'000'000ULL);
+            }
+        }
     }
 
     void wire_up_process(int k) {
@@ -483,14 +532,68 @@ public:
 
         if (k == 0 && rank_ != 0) {
             auto* p0_layout = reinterpret_cast<SharedLayout*>(metadata_base);
-            while (p0_layout->ready_flag.load(std::memory_order_acquire) != 1) {
-                ::usleep(1000);
+            // Poll ready_flag, then verify CRC. If the CRC fails (torn
+            // write / post-publish corruption / version mismatch), retry
+            // with a bounded limit of 30s (30000 × 1ms). After max
+            // retries, abort init() — the original behavior was to wait
+            // forever; this bounded abort means P0 startup must complete
+            // within 30s or P1 will give up (caller checks is_initialized()).
+            constexpr int CRC_MAX_RETRIES = 30000;  // 30s at 1ms/poll
+            constexpr int CRC_LOG_INTERVAL = 1000;   // log every ~1s
+            int crc_retries = 0;
+            while (true) {
+                if (p0_layout->ready_flag.load(std::memory_order_acquire) == 1) {
+                    uint32_t stored = p0_layout->crc32;
+                    uint32_t actual = p0_layout->compute_checksum();
+                    if (stored == actual) break;
+                    // CRC mismatch — treat as not-ready, retry
+                    if ((crc_retries % CRC_LOG_INTERVAL) == 0) {
+                        LOG_ERROR("wire_up_process: P0 metadata CRC mismatch"
+                                  << " (stored=0x" << std::hex << stored
+                                  << " actual=0x" << actual << std::dec
+                                  << ") retry " << crc_retries
+                                  << "/" << CRC_MAX_RETRIES);
+                    }
+                    if (++crc_retries >= CRC_MAX_RETRIES) {
+                        LOG_ERROR("wire_up_process: P0 metadata CRC mismatch"
+                                  << " — giving up after " << CRC_MAX_RETRIES
+                                  << " retries, aborting init"
+                                  << " (P0 layout_version=" << p0_layout->layout_version
+                                  << ", expected=" << SharedLayout::LAYOUT_VERSION
+                                  << "; possible version mismatch or corruption)");
+                        return;  // abort init; caller checks is_initialized()
+                    }
+                    ::usleep(1000);
+                } else {
+                    ::usleep(1000);
+                    // ready_flag not set yet — count toward retry budget
+                    // to avoid waiting forever if P0 crashed mid-init
+                    if (++crc_retries >= CRC_MAX_RETRIES) {
+                        LOG_ERROR("wire_up_process: P0 ready_flag timeout"
+                                  << " (" << CRC_MAX_RETRIES << "ms) — aborting");
+                        return;
+                    }
+                }
             }
         }
 
         typename BackendT::SharedRegionLayout ksl;
         if (k == 0) {
             auto* layout = reinterpret_cast<SharedLayout*>(metadata_base);
+            // For self (rank_==0), verify own CRC as a post-write self-check
+            // (catches bit-rot / write errors). If mismatch, return early —
+            // reading the corrupted offset fields would crash.
+            if (rank_ == 0) {
+                uint32_t stored = layout->crc32;
+                uint32_t actual = layout->compute_checksum();
+                if (stored != actual) {
+                    LOG_ERROR("wire_up_process: self metadata CRC mismatch"
+                              << " (stored=0x" << std::hex << stored
+                              << " actual=0x" << actual << std::dec
+                              << ") — aborting wire_up_process");
+                    return;
+                }
+            }
             ksl = compute_distributed_shared_region_layout<typename BackendT::AllocatorShared>(
                 0, static_cast<int>(MAX_PROCESSES), 0, 0, 0);
             ksl.help_array_offset = layout->help_array_offset;
@@ -574,6 +677,9 @@ public:
     void reset() {
         if (!initialized_) return;
 
+        // Stop HeartbeatThread first
+        stop_heartbeat_thread();
+
         if (reclaim_thread_) {
             bool fork_child = reclaim_thread_->stop();
             // fork_child: inherited condvar has stale __wrefs from parent's
@@ -644,10 +750,24 @@ public:
         soft_reset();
     }
 
+    // Stop HeartbeatThread
+    void stop_heartbeat_thread() {
+        if (heartbeat_thread_) {
+            bool fork_child = heartbeat_thread_->stop();
+            if (fork_child)
+                heartbeat_thread_.release();
+            else
+                heartbeat_thread_.reset();
+        }
+    }
+
     // Clear in-memory state without cleaning up shared memory.
     // Used by fork children that inherited the parent's GlobalAllocator state.
     // The parent's shms must NOT be touched — the child will re-init via init().
     void soft_reset() {
+        // Stop HeartbeatThread first.
+        stop_heartbeat_thread();
+
         if (reclaim_thread_) {
             bool fork_child = reclaim_thread_->stop();
             // fork_child: inherited condvar has stale __wrefs from parent's
@@ -703,7 +823,11 @@ public:
         backend_.bootstrap_ptr_ = nullptr;
         backend_.bootstrap_block_ = nullptr;
         backend_.bootstrap_handle_ = BackendT::INVALID_HANDLE;
+        // Clear per-peer tracking arrays so the child
+        // starts with a clean observation window.
         for (size_t k = 0; k < MAX_PROCESSES; ++k) {
+            backend_.last_seen_heartbeat_seq_[k].store(0, std::memory_order_relaxed);
+            backend_.last_heartbeat_change_ns_[k].store(0, std::memory_order_relaxed);
             backend_.metadata_regions_[k] = {};
             backend_.metadata_handles_[k] = BackendT::INVALID_HANDLE;
             for (int b = 0; b < BackendT::DATA_BRACKETS; ++b) {
@@ -1062,6 +1186,11 @@ public:
     static void reclaim_trigger_static() {
         auto* rt = get().reclaim_thread_.get();
         if (rt) rt->trigger_now();
+    }
+
+    // Heartbeat write callback for HeartbeatThread.
+    static void write_heartbeat_static() {
+        GlobalAllocator<BackendT>::get().backend_.write_heartbeat();
     }
 
     static void scan_all_segments_static() {

@@ -17,6 +17,7 @@ C++17 shared memory allocator for multi-process, multi-node deployments on ARMv8
   detection, `node_index` CAS assignment
 - **Freed memory return**: idle segments transition LIVE→DETACHED→RETURNED
   and are returned to the UBSE pool for cross-node reuse
+- **Dead-peer heartbeat detection**: an independent background thread periodically increments a heartbeat counter in the process's bootstrap slot; when a peer's counter stops advancing, its borrows are force-released and `wait_for_unreferenced` no longer hangs forever (disable via `UBALLOC_HEARTBEAT_ENABLED=0`)
 - **Introspection & defrag**: `return_stats` provides per-slab occupancy, Huge slot stats, empty-segment detection; `defrag_hints` returns live allocations in low-occupancy slabs for app-cooperative defragmentation
 - **Lazy attach**: userfaultfd-based on-demand segment attachment for remote
   data
