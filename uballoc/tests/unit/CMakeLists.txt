@@ -17,7 +17,10 @@ set(UBALLOC_UNIT_TEST_TARGETS
     test_ar06_realloc
     test_ar09_publish_lookup
     test_ar10_publishing_malloc
-    test_ar11_stl_containers)
+    test_ar11_stl_containers
+    test_ar12_sigsegv_handler
+    test_ar13_userfaultfd
+    test_ar14_ubse_provider)
 
 foreach(_target ${UBALLOC_UNIT_TEST_TARGETS})
     add_executable(${_target} ${_target}.cpp)
