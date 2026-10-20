@@ -1327,8 +1327,8 @@ public:
 
                         SlabIndex<B> slab_idx(slabs.segment_global_start(rank_, seg) + i);
                         Offset<B> offset = data.from_block(class_, slab_idx,
-                            Bit(u6(static_cast<uint8_t>(row)),
-                                u6(static_cast<uint8_t>(col))));
+                            Bit(u6(static_cast<uint8_t>(col)),
+                                u6(static_cast<uint8_t>(row))));
                         void* ptr = reinterpret_cast<void*>(
                             reinterpret_cast<char*>(data.base_) + offset.get());
 
