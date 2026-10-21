@@ -4,6 +4,7 @@
 
 #include "uballoc.hpp"
 #include "test_helpers.hpp"
+#include <algorithm>
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -14,27 +15,71 @@ extern "C" {
 }
 
 // Verify defrag_hints returns live allocations whose slab occupancy < threshold.
+//
+// Allocates a full Small slab (512 x 64B), then sparse-frees 3 of every 4
+// blocks so occupancy drops to 25% and every (row, col) with col % 4 == 0
+// is live. Each hint's ptr is verified three ways:
+//   1. h.ptr is in the live set (catches a transposed block index, where
+//      the hint points at a freed block or outside the slab)
+//   2. h.ptr's content still matches the fill pattern (a freed block's
+//      bytes are overwritten by the free-list, so a stale/wrong ptr
+//      fails this check)
+//   3. usable_size(h.ptr) == 64 (a ptr outside the slab fails this)
+// This covers the Bit(col,row) vs Bit(row,col) regression that the
+// original single-block test could not catch (row=col=0 is invariant
+// under transposition).
 static void test_defrag_hints_basic() {
     std::cout << "[defrag] defrag_hints basic..." << std::endl;
 
-    void* p = uballoc::malloc(64);
-    assert(p);
+    constexpr int N = 512;          // one full 64B slab (8 rows × 64 cols)
+    constexpr uint8_t PATTERN = 0xA5;
+    std::vector<void*> ptrs;
+    for (int i = 0; i < N; i++) {
+        void* p = uballoc::malloc(64);
+        assert(p);
+        std::memset(p, PATTERN, 64);
+        ptrs.push_back(p);
+    }
 
-    auto hints = uballoc::defrag_hints(0.5);
-    std::cout << "  defrag_hints(0.5) returned " << hints.size() << " hints" << std::endl;
-    assert(hints.size() >= 1);
-
-    bool found = false;
-    for (auto& h : hints) {
-        if (h.ptr == p) {
-            found = true;
-            assert(h.size == 64);
-            assert(h.occupancy < 0.5);
+    // Sparse-free: keep every 4th block → 128 live, 25% occupancy.
+    // The kept blocks span col ∈ {0,4,8,...,60} for every row ∈ {0..7},
+    // so a transposed Bit(row,col) index points outside the slab for
+    // col ≥ 8 (most cases) — exercising the regression.
+    std::vector<void*> live;
+    live.reserve(N / 4);
+    for (int i = 0; i < N; i++) {
+        if ((i % 4) != 0) {
+            uballoc::free(ptrs[i]);
+        } else {
+            live.push_back(ptrs[i]);
         }
     }
-    assert(found);
 
-    uballoc::free(p);
+    auto hints = uballoc::defrag_hints(0.5);
+    std::cout << "  defrag_hints(0.5) returned " << hints.size()
+              << " hints (live=" << live.size() << ")" << std::endl;
+    assert(hints.size() == live.size());
+
+    std::sort(live.begin(), live.end());
+    for (auto& h : hints) {
+        assert(h.ptr != nullptr);
+        assert(h.size == 64);
+        assert(h.occupancy < 0.5);
+        // 1. ptr must be one of the live allocations (not a freed block,
+        //    not a block outside this slab).
+        bool in_live = std::binary_search(live.begin(), live.end(), h.ptr);
+        assert(in_live);
+        // 2. ptr's content must still match the fill pattern (a freed
+        //    block's bytes are overwritten by the free-list).
+        auto* bytes = static_cast<const uint8_t*>(h.ptr);
+        for (int i = 0; i < 64; i++) {
+            assert(bytes[i] == PATTERN);
+        }
+        // 3. usable_size must report the block as a live 64B allocation.
+        assert(uballoc::usable_size(h.ptr) == 64);
+    }
+
+    for (void* p : live) uballoc::free(p);
     std::cout << "  defrag_hints basic: OK" << std::endl;
 }
 
