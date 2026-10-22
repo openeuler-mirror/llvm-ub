@@ -225,7 +225,7 @@ inline void uffd_wake(uintptr_t fault_addr, size_t len = 4096) {
 // -------------------------------------------------------------------------
 
 inline void uffd_poison(uintptr_t fault_addr, const char* reason, size_t len = 4096) {
-    LOG_ERROR("uffd_poison: fault=0x" << std::hex << fault_addr
+    LOG_WARN("uffd_poison: fault=0x" << std::hex << fault_addr
               << " reason=" << reason << std::dec);
 
     struct uffdio_range range;
@@ -683,7 +683,7 @@ void uffd_handler_thread() {
         uint32_t stored_crc = dir->descs[fi.s].crc32;
         uint32_t actual_crc = dir->descs[fi.s].compute_checksum();
         if (stored_crc != actual_crc) {
-            LOG_ERROR("uffd handler: P" << fi.k << " seg=" << fi.s
+            LOG_WARN("uffd handler: P" << fi.k << " seg=" << fi.s
                      << " CRC mismatch (stored=0x" << std::hex << stored_crc
                      << " actual=0x" << actual_crc << std::dec
                      << ") — poisoning fault address");
