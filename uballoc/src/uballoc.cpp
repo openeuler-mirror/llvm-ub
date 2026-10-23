@@ -18,6 +18,20 @@ void *uballoc_malloc(size_t size) {
     return uballoc::get_global_allocator().malloc(size);
 }
 
+void *uballoc_malloc_on(size_t size, uint32_t node_index,
+                        uballoc_node_fallback_t fallback) {
+    return uballoc::get_global_allocator().malloc_on(
+        size, node_index, static_cast<uballoc::NodeFallback>(fallback));
+}
+
+uint32_t uballoc_node_index_local(void) {
+    return uballoc::get_global_allocator().node_index_local();
+}
+
+uint32_t uballoc_node_index_of(const void *pointer) {
+    return uballoc::get_global_allocator().node_index_of(pointer);
+}
+
 void uballoc_free(void *pointer) {
     uballoc::get_global_allocator().free(pointer);
 }

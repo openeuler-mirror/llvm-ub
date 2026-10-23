@@ -24,6 +24,17 @@
 
 namespace uballoc {
 
+// Fallback policy for node-targeted allocation (malloc_on) when the
+// requested node cannot serve the allocation — invalid/unrouted node,
+// growth failure (MAX_SEGMENTS, quota, provider node down, single-node
+// provider), or the v1 head-only owned-list miss. C mirror:
+// uballoc_node_fallback_t (uballoc.h). See node_targeted_allocation.md §5.
+enum class NodeFallback : uint32_t {
+    Fail = 0,      // return nullptr
+    Local = 1,     // plain malloc (local-node-first)
+    AnyNode = 2,   // plain malloc (v1: identical to Local)
+};
+
 struct AllocatorContext {
     ThreadId id;
     AllocatorOwned* owned;
@@ -159,6 +170,52 @@ struct Allocator {
         HugeDescriptor desc;
         void* ptr = huge.allocate(thread_id, aligned_size, desc);
         return ptr;
+    }
+
+    // Node-targeted allocation (malloc_on, node_targeted_allocation.md §5).
+    // Routes Small/Large through the backing-filtered owned lists and
+    // node-targeted growth; Huge has no node targeting in v1 and applies
+    // the fallback directly. The pop-retry loop mirrors allocate()'s
+    // reclaim-race handling.
+    void* allocate_on(size_t size, uint32_t node, NodeFallback fallback) {
+        auto apply_fallback = [&]() -> void* {
+            if (fallback == NodeFallback::Fail) return nullptr;
+            return allocate(size);  // Local / AnyNode → plain malloc (v1: same)
+        };
+
+        if (node >= MAX_PROCESSES) return apply_fallback();
+
+        auto class_small = Small::new_from_size(size);
+        if (class_small) {
+            for (int retry = 0; retry < 64; ++retry) {
+                auto blk = small.allocate_on(thread_id, *class_small, node);
+                if (!blk) return apply_fallback();
+                void* ptr = small.pop(thread_id, *class_small, blk->first, blk->second);
+                if (ptr) {
+                    if (owned) owned->state.clear();
+                    return ptr;
+                }
+                // peeked (slab, block) went stale (reclaim race) — retry
+            }
+            return apply_fallback();
+        }
+
+        auto class_large = Large::new_from_size(size);
+        if (class_large) {
+            for (int retry = 0; retry < 64; ++retry) {
+                auto blk = large.allocate_on(thread_id, *class_large, node);
+                if (!blk) return apply_fallback();
+                void* ptr = large.pop(thread_id, *class_large, blk->first, blk->second);
+                if (ptr) {
+                    if (owned) owned->state.clear();
+                    return ptr;
+                }
+            }
+            return apply_fallback();
+        }
+
+        // Huge: no node targeting in v1 — apply the fallback.
+        return apply_fallback();
     }
 
     void free(void* ptr) {

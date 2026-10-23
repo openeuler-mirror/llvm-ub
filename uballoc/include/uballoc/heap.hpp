@@ -44,6 +44,20 @@ inline std::atomic<size_t>& batch_global_push() {
 
 inline std::atomic<size_t>& batch_bump_pop();
 
+// Slab backing-node lookup: slab index -> logical node index of the
+// segment's physical backing (SegmentDescriptor.provider_node). Injected
+// by GlobalAllocator at init (the backend owns the segment directories);
+// null outside a distributed heap — callers treat that as "unknown".
+//
+// Invariant (node_targeted_allocation.md §3): "where does this memory
+// physically live" is answered ONLY by this lookup — never by the owning
+// rank's node (rank-ownership is orthogonal to node-backing).
+template<typename B>
+inline std::atomic<uint32_t(*)(SlabIndex<B>)>& slab_backing_node_fn() {
+    static std::atomic<uint32_t(*)(SlabIndex<B>)> fn{nullptr};
+    return fn;
+}
+
 template<typename B>
 struct HeapShared {
     SlabStackGlobal<B> free;
@@ -162,6 +176,32 @@ struct HeapShared {
             }
             return growing_.load(std::memory_order_acquire) == 0;
         }
+    }
+
+    // Node-aware growth (malloc_on). Same protocol as try_grow, with two
+    // differences: the target node rides the invocation (the winner of the
+    // growing_ race grows the requested node's segment — no pending-
+    // parameter race), and a LOSER of the race returns false — the winner
+    // may have grown a different node's (or a plain local) segment, so the
+    // caller cannot assume its node's capacity appeared. Retry or fall back.
+    //
+    // Unlike try_grow, a failed invocation NEVER latches growing_=2: the
+    // failure modes here are per-request (unroutable node, quota, provider
+    // down) and the caller applies its own fallback — latching would
+    // poison plain growth for the whole rank. grow_segment's failure paths
+    // leave clean state (no segments_ push, no frontier move).
+    bool try_grow_node(NodeGrowFn fn, uint32_t node) {
+        uint32_t state = growing_.load(std::memory_order_acquire);
+        if (state == 2) return false;
+
+        uint32_t expected = 0;
+        if (growing_.compare_exchange_strong(expected, 1,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            bool success = fn && fn(node);
+            growing_.store(0u, std::memory_order_release);
+            return success;
+        }
+        return false;  // lost the race — do not assume our node grew
     }
 };
 
@@ -342,6 +382,72 @@ struct Heap {
 
     void set_help(DistributedHelpArray* h) { help_ = h; }
 
+    // Logical node index of the physical backing of idx's segment
+    // (UINT32_MAX = unknown: non-distributed heap, unregistered segment,
+    // or lookup not injected).
+    uint32_t slab_backing_node(SlabIndex<B> idx) {
+        auto fn = slab_backing_node_fn<B>().load(std::memory_order_acquire);
+        if (!fn) return UINT32_MAX;
+        return fn(idx);
+    }
+
+    // Node-targeted growth (malloc_on v1, node_targeted_allocation.md §7):
+    // grow a segment with provider={node}; the frontier-forward drain in
+    // grow_segment leaves the bump frontier inside the freshly grown
+    // (node-backed) segment, so the bump below lands in it. The final
+    // backing verification guards the rare race where a concurrent plain
+    // growth reset the frontier into a local-backed segment between our
+    // growing_ release and the bump — on mismatch the slab stays validly
+    // owned (plain malloc reuses it) and we report failure so the caller
+    // applies its fallback.
+    bool grow_on(ThreadId id, uint32_t node) {
+        NodeGrowFn fn = nullptr;
+        if constexpr (std::is_same_v<B, Small>) {
+            fn = grow_fn_small_on().load(std::memory_order_acquire);
+        } else if constexpr (std::is_same_v<B, Large>) {
+            fn = grow_fn_large_on().load(std::memory_order_acquire);
+        } else {
+            return false;  // Huge: no node targeting in v1
+        }
+        if (!fn) return false;
+        if (!shared->try_grow_node(fn, node)) return false;
+
+        auto range = shared->bump(id, Version(), data->slab_capacity_);
+        if (!range) return false;
+
+        uint32_t batch = batch_bump_pop().load(std::memory_order_relaxed);
+        slabs->link(id, range->start, range->end, std::nullopt);
+        owned->unsized.set(range->start, batch);
+        return slab_backing_node(range->start) == node;
+    }
+
+    // malloc_on v1 allocation path (node_targeted_allocation.md §5):
+    // (a) convert the owned unsized head when it is node-backed,
+    // (b) serve from the owned sized head when it is node-backed,
+    // (c) node-targeted growth, then (b) again over the seeded slab.
+    // Head-only in v1. Returns the (slab, block) to pop, or nullopt — the
+    // caller applies its NodeFallback policy.
+    std::optional<std::pair<SlabIndex<B>, Bit>> allocate_on(ThreadId id, B class_,
+                                                            uint32_t node) {
+        // (a) unsized head with matching backing → convert to class_
+        auto u = owned->unsized.peek();
+        if (u && slab_backing_node(*u) == node) {
+            owned->unsized_to_sized(id, owned->state, *slabs, class_);
+        }
+        // (b) sized head with matching backing?
+        auto idx = owned->sized[class_].peek();
+        if (!idx || slab_backing_node(*idx) != node) {
+            // (c) node-targeted growth, then re-seed and re-check
+            if (!grow_on(id, node)) return std::nullopt;
+            owned->unsized_to_sized(id, owned->state, *slabs, class_);
+            idx = owned->sized[class_].peek();
+            if (!idx || slab_backing_node(*idx) != node) return std::nullopt;
+        }
+        // Full peek (reclaim-stale retry) over the matching head.
+        return peek(id, class_, &node);
+    }
+
+
 #ifdef UBALLOC_RECOVER_CAS
     // Dispatch to store_small or store_large based on bracket type B.
     // Small uses discriminant 0x10 series, Large uses 0x20 series.
@@ -417,12 +523,24 @@ struct Heap {
         return data->template offset_to_pointer<char>(offset);
     }
 
-    std::optional<std::pair<SlabIndex<B>, Bit>> peek(ThreadId id, B class_) {
+    // require_node (malloc_on): when set, peek only serves the current
+    // sized[class] head if its slab's segment backing matches *require_node,
+    // and never falls back to plain allocate() when the sized stack is
+    // empty — the caller (allocate_on) owns the fallback policy.
+    std::optional<std::pair<SlabIndex<B>, Bit>> peek(ThreadId id, B class_,
+                                                     const uint32_t* require_node = nullptr) {
         while (true) {
             auto idx = owned->sized[class_].peek();
             if (!idx) {
+                if (require_node) return std::nullopt;
                 idx = allocate(id, class_);
                 if (!idx) return std::nullopt;
+            }
+            if (require_node && slab_backing_node(*idx) != *require_node) {
+                // Head slab is foreign-backed; v1 is head-only (no deep
+                // walk of the owned stack — see node_targeted_allocation.md
+                // §4, v1.5 is the deferred deep scan).
+                return std::nullopt;
             }
 
             SlabLocal<B>& local = slabs->local(*idx);

@@ -1186,7 +1186,47 @@ public:
         unmap_bootstrap_mapping(detach_name, should_detach);
     }
 
-    Result<int> create_data_segment(int bracket, size_t requested_slabs) {
+    // Resolve the UBSE slot_id of a logical node_index by scanning the
+    // bootstrap slots for a live rank on that node. Returns 0 when the node
+    // has no live rank (0 = unset slot id by bootstrap convention — callers
+    // treat it as "cannot target this node").
+    uint32_t my_node_index() const { return my_node_index_; }
+
+    uint32_t node_slot_id_of(uint32_t node_index) const {
+        if (!bootstrap_block_ || node_index >= MAX_PROCESSES) return 0;
+        for (size_t k = 0; k < MAX_PROCESSES; ++k) {
+            if (bootstrap_block_->slots[k].node_index.load(std::memory_order_acquire)
+                    == node_index &&
+                bootstrap_block_->slots[k].pid.load(std::memory_order_acquire) != 0) {
+                return bootstrap_block_->slots[k].node_slot_id.load(std::memory_order_acquire);
+            }
+        }
+        return 0;
+    }
+
+    // NodeDefault means "the creating rank's own node" — the historical
+    // behavior, reproduced exactly (provider slot 0 = local).
+    static constexpr uint32_t kNodeDefault = UINT32_MAX;
+
+    Result<int> create_data_segment(int bracket, size_t requested_slabs,
+                                    uint32_t provider_node = kNodeDefault) {
+        // Resolve the logical node: default → my node; validate the target.
+        uint32_t node = (provider_node == kNodeDefault) ? my_node_index_ : provider_node;
+        if (node >= MAX_PROCESSES) {
+            return Error(ErrorKind::Shm, "create_data_segment: invalid provider node");
+        }
+        // Resolve the provider slot for the ShmProvider layer. 0 = local
+        // (default) — bit-identical to the pre-node-targeting path.
+        uint32_t provider_slot_id = 0;
+        if (node != my_node_index_) {
+            provider_slot_id = node_slot_id_of(node);
+            if (provider_slot_id == 0) {
+                LOG_WARN("create_data_segment: no live rank on node " << node
+                         << " — cannot provision remotely");
+                return Error(ErrorKind::Shm, "no live rank on target node");
+            }
+        }
+
         int seg_idx = static_cast<int>(segments_[rank_][bracket].size());
 
         size_t seg_size;
@@ -1205,7 +1245,7 @@ public:
 
         SegmentEntry entry;
         auto res = create_and_map_own_region(rt, seg_size,
-            reinterpret_cast<void*>(va), seg_idx, &entry.handle);
+            reinterpret_cast<void*>(va), seg_idx, &entry.handle, provider_slot_id);
         if (is_err(res)) return unwrap_err(res);
         entry.region = unwrap(res);
         segments_[rank_][bracket].push_back(std::move(entry));
@@ -1226,6 +1266,7 @@ public:
                 dir->descs[seg_idx].name[63] = '\0';
                 dir->descs[seg_idx].total_size = seg_size;
                 dir->descs[seg_idx].slab_count = requested_slabs;
+                dir->descs[seg_idx].provider_node = node;
                 // Compute CRC before publishing.
                 dir->descs[seg_idx].crc32 = dir->descs[seg_idx].compute_checksum();
                 dir->descs[seg_idx].ready.store(1, std::memory_order_release);
@@ -1233,7 +1274,8 @@ public:
         }
 
         LOG_INFO("create_data_segment: bracket=" << bracket << " seg=" << seg_idx
-                 << " slabs=" << requested_slabs << " size=" << seg_size);
+                 << " slabs=" << requested_slabs << " size=" << seg_size
+                 << " provider_node=" << node);
 
         requested_from_os_bytes_ += entry.region.size;
 
@@ -2040,16 +2082,22 @@ public:
     // import_desc_cnt is still decremented — so refcounting is MANDATORY
     // to prevent premature shm_delete completion.
     Result<ShmHandle> create_with_refcount(int lender_rank, RegionType type,
-                                             int seg_idx, size_t effective_size) {
+                                             int seg_idx, size_t effective_size,
+                                             uint32_t provider_slot_id = 0) {
         std::string name = ShmProviderT::shm_name(heap_id_, lender_rank,
                                                    static_cast<int>(type), seg_idx);
 
         if constexpr (ShmProviderT::is_single_node) {
-            // POSIX: no refcount, just create
-            return ShmProviderT::shm_try_create(name, effective_size);
+            // POSIX: no refcount, just create (single-node provider rejects
+            // non-zero provider_slot_id inside shm_try_create_on).
+            return ShmProviderT::shm_try_create_on(name, effective_size, provider_slot_id);
         }
 
-        // UBSE: optimistic increment BEFORE shm_try_create
+        // UBSE: optimistic increment BEFORE shm_try_create. NOTE: the
+        // refcount row is the CREATOR's node (my_node_index_) — the creator
+        // imports the shm even when the provider is a remote node (it
+        // attaches as a cross-node borrower of its own shm); the provider
+        // node is the lender, not a borrower, so it holds no row here.
         std::atomic<uint16_t>* refc = get_refcount_ptr(lender_rank, type, seg_idx);
         uint16_t before = refc[my_node_index_].load(std::memory_order_acquire);
         refc[my_node_index_].fetch_add(1, std::memory_order_acq_rel);
@@ -2058,7 +2106,7 @@ public:
                  << " seg=" << seg_idx << " node=" << my_node_index_
                  << " before=" << before << " -> " << (before + 1));
 
-        auto res = ShmProviderT::shm_try_create(name, effective_size);
+        auto res = ShmProviderT::shm_try_create_on(name, effective_size, provider_slot_id);
         if (is_err(res)) {
             // Create failed — undo the optimistic increment
             uint16_t prev = refc[my_node_index_]
@@ -2110,17 +2158,19 @@ public:
     }
 
     Result<Region> create_and_map_own_region(RegionType type, size_t size, void* fixed_va,
-                                                 int segment_idx = 0, ShmHandle* out_handle = nullptr) {
+                                                 int segment_idx = 0, ShmHandle* out_handle = nullptr,
+                                                 uint32_t provider_slot_id = 0) {
         size_t effective_size = round_up_shm_size(size);
         std::string name = ShmProviderT::shm_name(heap_id_, rank_, static_cast<int>(type), segment_idx);
-        LOG_INFO("create_own_region: name=" << name << " logical=" << size << " effective=" << effective_size << " VA=" << fixed_va);
+        LOG_INFO("create_own_region: name=" << name << " logical=" << size << " effective=" << effective_size << " VA=" << fixed_va
+                 << " provider_slot=" << provider_slot_id);
         // §9b: Use create_with_refcount (optimistic increment BEFORE
         // shm_try_create). The lender's own node gets a self-map borrow
         // from shm_create (obmm_import on lender's own node). The
         // self-map detach is a no-op at OBMM level, but the daemon's
         // import_desc_cnt is still decremented — so refcounting is
         // MANDATORY to prevent premature shm_delete completion.
-        auto handle_res = create_with_refcount(rank_, type, segment_idx, effective_size);
+        auto handle_res = create_with_refcount(rank_, type, segment_idx, effective_size, provider_slot_id);
         if (is_err(handle_res)) {
             auto err = unwrap_err(handle_res);
             if (err.kind == ErrorKind::ShmExists) {
@@ -2129,7 +2179,7 @@ public:
                 // Retry with create_with_refcount (the optimistic increment
                 // was already undone inside the previous create_with_refcount
                 // failure path).
-                handle_res = create_with_refcount(rank_, type, segment_idx, effective_size);
+                handle_res = create_with_refcount(rank_, type, segment_idx, effective_size, provider_slot_id);
                 if (is_err(handle_res)) {
                     auto err2 = unwrap_err(handle_res);
                     if (err2.kind == ErrorKind::ShmExists) {

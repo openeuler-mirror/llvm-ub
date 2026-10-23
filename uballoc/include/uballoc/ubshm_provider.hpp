@@ -188,6 +188,25 @@ struct UBShmProvider {
     }
 
     static Result<ShmHandle> shm_try_create(const std::string& name, size_t size) {
+        return shm_try_create_on(name, size, 0);
+    }
+
+    // Create a shm whose physical backing (the UBSE "provider"/lender node)
+    // is provider_slot_id.
+    //
+    // provider_slot_id == 0 means "local node" — the historical behavior,
+    // reproduced bit-for-bit (0 is the unset slot id throughout the
+    // bootstrap conventions).
+    //
+    // provider_slot_id != 0 requests REMOTE provisioning: the shm's
+    // export_node becomes the provider node, so that node's processes
+    // attach as cacheable self-maps while everyone else — including this
+    // creator, when creator != provider — attaches as an NC cross-node
+    // borrower. Never combine this with UBS_MEM_FLAG_CACHEABLE; the
+    // location-based coherence rules are the contract (see
+    // node_targeted_allocation.md §2).
+    static Result<ShmHandle> shm_try_create_on(const std::string& name, size_t size,
+                                               uint32_t provider_slot_id) {
         uint8_t usr_info[UBS_MEM_MAX_USR_INFO_LEN] = {0};
 
         ubs_topo_node_t *node_list = nullptr;
@@ -209,7 +228,8 @@ struct UBShmProvider {
             region.slot_ids[i] = node_list[i].slot_id;
 
         ubs_mem_nodes_t provider;
-        provider.slot_ids[0] = local_node.slot_id;
+        provider.slot_ids[0] = (provider_slot_id != 0) ? provider_slot_id
+                                                       : local_node.slot_id;
         provider.node_cnt = 1;
 
         uint64_t flag = UBS_MEM_FLAG_NO_WR_DELAY | UBS_MEM_FLAG_SHM_ANONYMOUS;
@@ -219,7 +239,8 @@ struct UBShmProvider {
             return Error(ErrorKind::ShmExists);
         }
         if (ret != 0) {
-            LOG_WARN("ubs_mem_shm_create failed, ret=" << ret);
+            LOG_WARN("ubs_mem_shm_create failed, ret=" << ret
+                     << " provider_slot=" << provider_slot_id);
         }
 
         // Re-register the no-op log callback after ubs_mem_shm_create

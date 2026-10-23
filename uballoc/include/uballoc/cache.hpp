@@ -33,6 +33,20 @@ inline std::atomic<GrowFn>& grow_fn_huge() {
     return fn;
 }
 
+// Node-targeted growth (malloc_on): the target node rides the invocation,
+// so the winner of the growing_ race grows the requested node's segment
+// (no pending-parameter race). See node_targeted_allocation.md §7.
+using NodeGrowFn = bool(*)(uint32_t);
+
+inline std::atomic<NodeGrowFn>& grow_fn_small_on() {
+    static std::atomic<NodeGrowFn> fn{nullptr};
+    return fn;
+}
+inline std::atomic<NodeGrowFn>& grow_fn_large_on() {
+    static std::atomic<NodeGrowFn> fn{nullptr};
+    return fn;
+}
+
 using CheckRemoteFn = bool(*)();
 
 inline std::atomic<CheckRemoteFn>& check_remote_fn() {
