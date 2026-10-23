@@ -29,6 +29,7 @@ Applicable scenarios: allocation, free, publish, discovery, and cross-node acces
 | Asynchronous memory reclaim | Supports SYNC/ASYNC modes for returning idle Small/Large segments to the OS. ASYNC mode (default) uses a background thread with jemalloc-style timed scanning — zero hot-path overhead on malloc/free. SYNC mode triggers inline in malloc/free. The `decay1`/`decay2` timers control the LIVE→DETACHED→RETURNED state machine; `purge()` skips timers for immediate return. |
 | Memory statistics & introspection | Query memory flow statistics via `return_stats()`: bytes requested from OS, bytes returned to OS, bytes allocated to app, bytes freed by app, and `fragmentation_ratio`. In ASYNC mode, the background thread auto-emits `[RECLAIM-STATS]` log every 30 scans. |
 | Defragmentation | `uballoc::usable_size(ptr)` returns the usable size of an allocation (for right-sizing to avoid unnecessary reallocs); `uballoc::defrag_hints(threshold)` returns live allocations in low-occupancy memory regions; the application performs malloc+memcpy+fixrefs+free for cooperative defragmentation. |
+| Node-targeted allocation | `uballoc::malloc_on(size, node_index, fallback)` allocates memory whose physical backing is a specific node — reusing this process's free capacity on that node, or provisioning a new segment on it via the UBSE provider API. `uballoc::node_index_local()` / `uballoc::node_index_of(ptr)` expose node identity. See [Node-Targeted Allocation](#node-targeted-allocation). |
 | CRTP zero-overhead backend | The backend dispatches statically via CRTP — no virtual calls on the allocation hot path. ARMv8.1 LSE atomics are optional, compile-time toggleable. |
 | Crash recovery | Three optional mechanisms — detectable CAS, state logging, cache flushing — support post-crack scan-and-rebuild of allocator state. |
 | Dead-peer heartbeat detection | An independent background thread periodically increments a heartbeat counter in the process's bootstrap slot (default interval 5s). When a peer's counter stops advancing for longer than `UBALLOC_DEAD_PEER_TIMEOUT_MS` (default 30s), it is declared dead: its borrowed segments are force-released, and `wait_for_unreferenced` no longer hangs forever. Disable via `UBALLOC_HEARTBEAT_ENABLED=0`. See [Dead-Peer Heartbeat Detection](#dead-peer-heartbeat-detection). |
@@ -1525,6 +1526,46 @@ The above results are for reference only; actual results may vary.
 ### Do fork children start a background reclaim thread?
 
 No. Fork children's `init()` detects PID change and skips ReclaimThread creation. Fork children are typically short-lived (alloc+free then `_exit`), so background reclaim is unnecessary. If needed, fork children can use SYNC mode or `purge()`.
+
+---
+
+## Node-Targeted Allocation
+
+### Overview
+
+`malloc_on` extends the allocation API with an explicit placement target: the returned memory is physically backed by the given node (the UBSE provider/lender node). The default `malloc` remains local-node-first and is unchanged; node targeting is a per-call opt-in.
+
+```cpp
+enum class NodeFallback : uint32_t { Fail = 0, Local = 1, AnyNode = 2 };
+
+void*    malloc_on(size_t size, uint32_t node_index, NodeFallback fallback);
+uint32_t node_index_local();              // this process's node
+uint32_t node_index_of(const void* ptr);  // backing node of an allocation
+```
+
+C API: `uballoc_malloc_on(size, node_index, uballoc_node_fallback_t)`, `uballoc_node_index_local()`, `uballoc_node_index_of(ptr)`.
+
+### Semantics
+
+1. **Serving order (Small/Large)**: memory already owned by this process on the target node is reused (the head of the owned lists, filtered by the segment's backing node); otherwise a new segment is provisioned **on the target node** via UBSE's `provider` node set. Growth on a remote node is the key capability: the creating rank owns the segment (its VA region, its segment directory), while the memory physically resides on the target node.
+2. **Fallback**: when the node cannot serve the request — invalid node, no live rank on the node, growth failure (quota, `MAX_SEGMENTS`, provider node down), or a non-zero node on the single-node POSIX build — `Fail` returns `nullptr`; `Local`/`AnyNode` fall back to plain `malloc`. Note a failed node-targeted growth does not disable later growth (unlike a failed plain growth).
+3. **Guarantee**: `node_index_of(ptr)` of the result equals the requested node. This holds even for `node_index == node_index_local()` — unlike plain `malloc`, which under `reuse-first` affinity may return cross-node memory.
+4. **Huge** sizes have no node targeting and apply the fallback directly.
+5. `free()` is unchanged (ownership-routed, node-agnostic). Blocks of a node-N-backed slab may later be served to plain `malloc` — the memory is on node N regardless of which call served it.
+
+### Coherence rules
+
+Cache behavior is **location-based**: processes on the backing node access the memory through their caches (self-map), everyone else — including the creator, when creating on a remote node — accesses it non-cacheable across the fabric. Use `malloc_on(N)` for data that is *accessed* on node N.
+
+### v1 limitations
+
+- Free node-N capacity owned by *other* ranks is not consulted (each `malloc_on` growth creates a new segment; reclaimed segments return via the existing decay path).
+- Only the head of the owned lists is filtered (no deep scan).
+- `node_index_of` returns `(uint32_t)-1` for Huge allocations, non-uballoc pointers, and segments whose owning rank's metadata is not mapped locally.
+
+### Tests
+
+`tests/unit/test_malloc_on.cpp` — automated POSIX subset plus a two-node UBSE manual recipe (`UBALLOC_ROLE=P0|P1`).
 
 ---
 

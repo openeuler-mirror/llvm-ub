@@ -53,6 +53,42 @@ void *uballoc_malloc(size_t size);
 
 void uballoc_free(void *pointer);
 
+/**
+ * Node-targeted allocation: allocate memory whose physical backing is
+ * `node_index` (a logical node id; see uballoc_node_index_local()). When
+ * this process already owns free capacity on that node it is reused;
+ * otherwise a new segment is provisioned on the node (UBSE provider).
+ *
+ * `fallback` selects the behavior when the node cannot serve the request
+ * (invalid node, no live rank on the node, growth failure, or the
+ * single-node POSIX provider with node != 0):
+ *   UBALLOC_NODE_FALLBACK_FAIL  - return NULL
+ *   UBALLOC_NODE_FALLBACK_LOCAL - fall back to plain (local-first) malloc
+ *   UBALLOC_NODE_FALLBACK_ANY   - fall back to plain malloc
+ *
+ * The returned pointer is freed with uballoc_free() like any other
+ * allocation. Huge-class sizes have no node targeting and apply the
+ * fallback directly.
+ */
+typedef enum uballoc_node_fallback {
+    UBALLOC_NODE_FALLBACK_FAIL = 0,
+    UBALLOC_NODE_FALLBACK_LOCAL = 1,
+    UBALLOC_NODE_FALLBACK_ANY = 2,
+} uballoc_node_fallback_t;
+
+void *uballoc_malloc_on(size_t size, uint32_t node_index,
+                        uballoc_node_fallback_t fallback);
+
+/** The caller's own (logical) node index. */
+uint32_t uballoc_node_index_local(void);
+
+/**
+ * The logical backing node of an allocation. Returns (uint32_t)-1 when
+ * unknown: not a uballoc pointer, a Huge-class allocation, or a segment
+ * whose owning rank's metadata is not mapped locally.
+ */
+uint32_t uballoc_node_index_of(const void *pointer);
+
 void *uballoc_realloc(void *pointer, size_t size);
 
 /**

@@ -385,6 +385,16 @@ public:
                               std::memory_order_release);
         grow_fn_large().store(&GlobalAllocator<BackendT>::grow_large_static,
                               std::memory_order_release);
+        grow_fn_small_on().store(&GlobalAllocator<BackendT>::grow_small_on_static,
+                                 std::memory_order_release);
+        grow_fn_large_on().store(&GlobalAllocator<BackendT>::grow_large_on_static,
+                                 std::memory_order_release);
+        slab_backing_node_fn<Small>().store(
+            &GlobalAllocator<BackendT>::slab_backing_small_static,
+            std::memory_order_release);
+        slab_backing_node_fn<Large>().store(
+            &GlobalAllocator<BackendT>::slab_backing_large_static,
+            std::memory_order_release);
         grow_fn_huge().store(&GlobalAllocator<BackendT>::grow_huge_static,
                               std::memory_order_release);
         check_remote_fn().store(&GlobalAllocator<BackendT>::check_remote_segments_static,
@@ -821,6 +831,10 @@ public:
         grow_fn_small().store(nullptr, std::memory_order_release);
         grow_fn_large().store(nullptr, std::memory_order_release);
         grow_fn_huge().store(nullptr, std::memory_order_release);
+        grow_fn_small_on().store(nullptr, std::memory_order_release);
+        grow_fn_large_on().store(nullptr, std::memory_order_release);
+        slab_backing_node_fn<Small>().store(nullptr, std::memory_order_release);
+        slab_backing_node_fn<Large>().store(nullptr, std::memory_order_release);
         check_remote_fn().store(nullptr, std::memory_order_release);
         reclaim_fn_small().store(nullptr, std::memory_order_release);
         reclaim_fn_large().store(nullptr, std::memory_order_release);
@@ -1186,6 +1200,33 @@ public:
     static bool grow_large_static() {
         return GlobalAllocator<BackendT>::get().grow_segment(1);
     }
+    static bool grow_small_on_static(uint32_t node) {
+        return GlobalAllocator<BackendT>::get().grow_segment(0, node);
+    }
+    static bool grow_large_on_static(uint32_t node) {
+        return GlobalAllocator<BackendT>::get().grow_segment(1, node);
+    }
+
+    // Slab backing-node lookup, injected into Heap<B> via
+    // slab_backing_node_fn<B> (node_targeted_allocation.md §6).
+    static uint32_t slab_backing_small_static(SlabIndex<Small> idx) {
+        auto& ga = GlobalAllocator<BackendT>::get();
+        return ga.slab_backing_impl(ga.small_slab_, idx, 0);
+    }
+    static uint32_t slab_backing_large_static(SlabIndex<Large> idx) {
+        auto& ga = GlobalAllocator<BackendT>::get();
+        return ga.slab_backing_impl(ga.large_slab_, idx, 1);
+    }
+    template<typename B>
+    uint32_t slab_backing_impl(Slab<B>& slabs, SlabIndex<B> idx, int bracket) {
+        int pid = slabs.find_process(idx.get());
+        size_t local_idx = idx.get() - slabs.cumulative[pid];
+        auto loc = slabs.find_segment(pid, local_idx);
+        if (loc.seg >= MAX_SEGMENTS) return UINT32_MAX;
+        SegmentDirectory* dir = backend_.segment_directory(pid, bracket);
+        if (!dir || static_cast<size_t>(loc.seg) >= MAX_SEGMENTS) return UINT32_MAX;
+        return dir->descs[loc.seg].provider_node;
+    }
     static bool grow_huge_static() {
         return GlobalAllocator<BackendT>::get().grow_segment(2);
     }
@@ -1396,7 +1437,52 @@ public:
         return total;
     }
 
-    bool grow_segment(int bracket) {
+    // Frontier-forward drain (node_targeted_allocation.md §7): atomically
+    // advance the bump frontier to the new segment's start; any skipped
+    // virgin range is linked and pushed onto this rank's global free stack
+    // (one chain push) so nothing is stranded. Replaces the previous
+    // unconditional store — for plain growth (frontier exhausted) the drain
+    // is empty and the CAS is equivalent; for node-targeted growth the
+    // frontier may sit mid-segment and the skipped range is salvaged.
+    // Runs under the growing_ serialization inside grow_segment.
+    template<typename B>
+    void frontier_forward_drain(HeapShared<B>* shared, Slab<B>& slabs,
+                                ThreadId id, size_t global_start) {
+        const uint64_t desired = SlabIndex<B>(global_start).internal();
+        uint64_t old_raw = shared->bump_raw.load(std::memory_order_acquire);
+        if (old_raw == 0) {
+            // Uninitialized frontier (not expected post-init) — plain store.
+            shared->bump_raw.store(desired, std::memory_order_release);
+            return;
+        }
+        for (;;) {
+            uint64_t cur = old_raw;
+            if (shared->bump_raw.compare_exchange_strong(cur, desired,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
+            old_raw = cur;  // a concurrent bump moved the frontier — retry
+        }
+        SlabIndex<B> old_idx = SlabIndex<B>::unpack(old_raw);
+        if (old_idx.get() < global_start) {
+            // Drain [old_idx, global_start): link the chain and push it
+            // onto this rank's global free stack. Concurrent bumpers are
+            // excluded from the range by construction (any fetch_add inside
+            // it would have failed our CAS).
+            DistributedHelpArray* help = distributed_shared_ptrs_[rank_]
+                ? &distributed_shared_ptrs_[rank_]->help : nullptr;
+            slabs.link(id, old_idx, SlabIndex<B>(global_start), std::nullopt);
+            shared->free.push(id, slabs, old_idx,
+                              SlabIndex<B>(global_start - 1), help);
+            LOG_INFO("frontier_forward_drain: " << (global_start - old_idx.get())
+                     << " virgin slabs -> global free stack");
+        }
+        // old > global_start (over-run past the new start after a failed
+        // bump): the CAS rolls it back; the over-run advance never handed
+        // anything out, so there is nothing to drain.
+    }
+
+    bool grow_segment(int bracket, uint32_t provider_node = BackendT::kNodeDefault) {
         if (bracket == 0) {
             size_t sps = SegmentLayout<Small>::virtual_slabs_per_segment();
             size_t max_slabs = SegmentLayout<Small>::compute(sps).slab_count;
@@ -1406,7 +1492,7 @@ public:
             // Use compute().slab_count so create_data_segment sees the
             // actual number of slabs (compute may cap it to fit target size).
             requested = SegmentLayout<Small>::compute(requested).slab_count;
-            auto res = backend_.create_data_segment(0, requested);
+            auto res = backend_.create_data_segment(0, requested, provider_node);
             if (is_err(res)) return false;
             int seg_idx = unwrap(res);
 
@@ -1425,8 +1511,9 @@ public:
             }
 
             size_t global_start = cumulative_small_[rank_] + cumulative_slab_count(0, seg_count);
-            small_shared_ptrs_[rank_]->bump_raw.store(
-                SlabIndex<Small>(global_start).internal(), std::memory_order_release);
+            ensure_thread_init();
+            frontier_forward_drain(small_shared_ptrs_[rank_], small_slab_,
+                                   ThreadId(tl_thread_id_), global_start);
             small_shared_ptrs_[rank_]->bump_end_atomic_.store(
                 global_start + sl.slab_count, std::memory_order_release);
             small_shared_ptrs_[rank_]->segment_count_.fetch_add(1, std::memory_order_release);
@@ -1442,7 +1529,7 @@ public:
 
             size_t requested = segment_ladder_slab_count(Large::SLAB_SIZE, max_slabs, seg_count);
             requested = SegmentLayout<Large>::compute(requested).slab_count;
-            auto res = backend_.create_data_segment(1, requested);
+            auto res = backend_.create_data_segment(1, requested, provider_node);
             if (is_err(res)) return false;
             int seg_idx = unwrap(res);
 
@@ -1459,8 +1546,9 @@ public:
             }
 
             size_t global_start = cumulative_large_[rank_] + cumulative_slab_count(1, seg_count);
-            large_shared_ptrs_[rank_]->bump_raw.store(
-                SlabIndex<Large>(global_start).internal(), std::memory_order_release);
+            ensure_thread_init();
+            frontier_forward_drain(large_shared_ptrs_[rank_], large_slab_,
+                                   ThreadId(tl_thread_id_), global_start);
             large_shared_ptrs_[rank_]->bump_end_atomic_.store(
                 global_start + sl.slab_count, std::memory_order_release);
             large_shared_ptrs_[rank_]->segment_count_.fetch_add(1, std::memory_order_release);
@@ -1595,6 +1683,39 @@ public:
 
     void* malloc(size_t size) {
         return current_allocator().allocate(size);
+    }
+
+    // Node-targeted allocation (node_targeted_allocation.md §5).
+    void* malloc_on(size_t size, uint32_t node_index, NodeFallback fallback) {
+        return current_allocator().allocate_on(size, node_index, fallback);
+    }
+
+    // The caller's own (logical) node index.
+    uint32_t node_index_local() {
+        return backend_.my_node_index();
+    }
+
+    // Logical backing node of an allocation (SegmentDescriptor.provider_node
+    // of the slab's segment). UINT32_MAX for non-uballoc pointers, Huge
+    // allocations (no node targeting in v1), or segments whose owning
+    // rank's metadata is not mapped locally.
+    uint32_t node_index_of(const void* ptr) {
+        if (!ptr || !initialized_) return UINT32_MAX;
+        auto& a = current_allocator();
+
+        auto so = a.small.checked_pointer_to_offset(const_cast<void*>(ptr));
+        if (so) {
+            if (!a.small.slabs) return UINT32_MAX;
+            SlabIndex<Small> idx = a.small.data->into_index(*so);
+            return slab_backing_impl(*a.small.slabs, idx, 0);
+        }
+        auto lo = a.large.checked_pointer_to_offset(const_cast<void*>(ptr));
+        if (lo) {
+            if (!a.large.slabs) return UINT32_MAX;
+            SlabIndex<Large> idx = a.large.data->into_index(*lo);
+            return slab_backing_impl(*a.large.slabs, idx, 1);
+        }
+        return UINT32_MAX;  // Huge or foreign pointer
     }
 
     // Combined malloc+publish: allocates `size` bytes and publishes the pointer
@@ -1913,6 +2034,18 @@ inline void* malloc(size_t size) {
 
 inline void* malloc(size_t size, uint32_t type_id) {
     return get_global_allocator().malloc(size, type_id);
+}
+
+inline void* malloc_on(size_t size, uint32_t node_index, NodeFallback fallback) {
+    return get_global_allocator().malloc_on(size, node_index, fallback);
+}
+
+inline uint32_t node_index_local() {
+    return get_global_allocator().node_index_local();
+}
+
+inline uint32_t node_index_of(const void* ptr) {
+    return get_global_allocator().node_index_of(ptr);
 }
 
 inline void free(void* ptr) {

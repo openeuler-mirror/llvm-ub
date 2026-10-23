@@ -29,6 +29,7 @@ uballoc是专为aarch64架构、Linux操作系统下多进程多节点分布式�
 | 异步内存归还 | 支持SYNC/ASYNC两种模式将空闲段（Small/Large）归还给操作系统。ASYNC模式（默认）由后台线程定时扫描归还，malloc/free热路径零开销；SYNC模式在malloc/free内联触发。通过`decay1`/`decay2`定时器控制LIVE→DETACHED→RETURNED状态机转换，`purge()`可跳过定时器立即归还。 |
 | 内存统计与内省 | 通过`return_stats()`查询内存流转统计：从OS申请字节数、归还OS字节数、分配给应用字节数、应用释放字节数，以及碎片率`fragmentation_ratio`。ASYNC模式下后台线程每30轮扫描自动输出`[RECLAIM-STATS]`日志。 |
 | 碎片整理 | `uballoc::usable_size(ptr)`返回分配的可用大小（可用于right-sizing避免不必要realloc）；`uballoc::defrag_hints(threshold)`返回低占用率内存区域中的活跃分配列表，应用执行malloc+memcpy+fixrefs+free完成协作式碎片整理。 |
+| 节点定向分配 | `uballoc::malloc_on(size, node_index, fallback)`分配物理上位于指定节点的内存——优先复用本进程在该节点的空闲容量，否则通过UBSE provider API在该节点上新供段。`uballoc::node_index_local()`/`uballoc::node_index_of(ptr)`提供节点身份查询。详见[节点定向分配](#节点定向分配)。 |
 | CRTP零开销后端 | 后端通过CRTP静态分派，分配热路径无虚函数调用；可选ARMv8.1 LSE原子指令，编译期开关。 |
 | 崩溃恢复 | 可检测CAS、状态日志、缓存刷写三档可选机制，支持崩溃后扫描重建分配器状态。 |
 | 死节点心跳检测 | 每进程由独立后台线程周期递增心跳计数器至 bootstrap 槽位（默认间隔 5s）。peer 的计数器停止推进超过 `UBALLOC_DEAD_PEER_TIMEOUT_MS`（默认 30s）时，判定为死亡：自动强制释放其借用段，`wait_for_unreferenced` 不再永久挂起。可通过 `UBALLOC_HEARTBEAT_ENABLED=0` 关闭。详见[死节点心跳检测](#死节点心跳检测)。 |
@@ -1520,6 +1521,46 @@ local
 ### fork子进程会启动后台回收线程吗？
 
 不会。fork子进程的`init()`检测到PID变化后跳过ReclaimThread创建。fork子进程通常短命（分配+释放后`_exit`），不需要后台回收。如果fork子进程需要回收，可通过SYNC模式或`purge()`触发。
+
+---
+
+## 节点定向分配
+
+### 功能说明
+
+`malloc_on` 在分配 API 上增加显式的放置目标：返回的内存物理上由指定节点背书（UBSE 的 provider/借出节点）。默认的 `malloc` 仍为本地节点优先，行为不变；节点定向是按次调用的可选能力。
+
+```cpp
+enum class NodeFallback : uint32_t { Fail = 0, Local = 1, AnyNode = 2 };
+
+void*    malloc_on(size_t size, uint32_t node_index, NodeFallback fallback);
+uint32_t node_index_local();              // 本进程所在节点
+uint32_t node_index_of(const void* ptr);  // 某分配的物理背书节点
+```
+
+C API：`uballoc_malloc_on(size, node_index, uballoc_node_fallback_t)`、`uballoc_node_index_local()`、`uballoc_node_index_of(ptr)`。
+
+### 语义
+
+1. **供给顺序（Small/Large）**：优先复用本进程已持有的该节点内存（按段的背书节点过滤自有链表表头）；否则通过 UBSE 的 `provider` 节点集**在目标节点上**新供一个段。远端供段是关键能力：创建进程拥有该段（其 VA 区域、其段目录），而内存物理上位于目标节点。
+2. **回退**：当目标节点无法满足请求——节点号无效、该节点无存活进程、增长失败（配额、`MAX_SEGMENTS`、节点宕机）、或在单节点 POSIX 构建上指定非零节点——`Fail` 返回 `nullptr`；`Local`/`AnyNode` 回退到普通 `malloc`。注意：节点定向增长的失败不会禁用后续增长（与普通增长失败不同）。
+3. **保证**：结果的 `node_index_of(ptr)` 等于请求的节点。即使 `node_index == node_index_local()` 也成立——普通 `malloc` 在 `reuse-first` 亲和下可能返回跨节点内存，而 `malloc_on` 不会。
+4. **Huge** 尺寸不支持节点定向，直接应用回退。
+5. `free()` 不变（按所有权路由，与节点无关）。节点 N 背书的 slab 中的块后续也可能由普通 `malloc` 分出——无论哪个调用分出，内存都在节点 N 上。
+
+### 缓存一致性规则
+
+缓存行为是**基于位置**的：背书节点上的进程通过自身缓存访问该内存（self-map）；其他所有进程——包括在远端节点上创建段的创建者本身——通过跨 fabric 的非缓存（NC）方式访问。为**在节点 N 上被访问**的数据使用 `malloc_on(N)`。
+
+### v1 限制
+
+- 不复用*其他* rank 持有的该节点空闲容量（每次 `malloc_on` 增长新供一个段；空闲段经既有 decay 路径归还）。
+- 仅过滤自有链表表头（不做深扫描）。
+- `node_index_of` 对 Huge 分配、非 uballoc 指针、以及所属 rank 元数据未在本地映射的段返回 `(uint32_t)-1`。
+
+### 测试
+
+`tests/unit/test_malloc_on.cpp` —— POSIX 自动化子集 + 双节点 UBSE 手工用例（`UBALLOC_ROLE=P0|P1`）。
 
 ---
 

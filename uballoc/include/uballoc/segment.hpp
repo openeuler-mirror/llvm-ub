@@ -46,15 +46,22 @@ struct SegmentDescriptor {
     char name[64];
     size_t total_size;
     size_t slab_count;
-    // CRC32 of name + total_size + slab_count (immutable after creation;
-	// ready is the publish flag, excluded).
+    // Logical node index of the segment's physical backing (the UBSE
+    // provider/lender node at creation time). Invariant: "where does this
+    // memory physically live" is answered ONLY by this field — never by
+    // the owning rank's node (rank-ownership is orthogonal to node-backing;
+    // see node_targeted_allocation.md §3). 0 on the single-node POSIX
+    // provider. Immutable after creation, covered by the CRC span.
+    uint32_t provider_node;
+    // CRC32 of name + total_size + slab_count + provider_node (immutable
+    // after creation; ready is the publish flag, excluded).
     uint32_t crc32;
     std::atomic<uint32_t> ready;
     // attach_count moved to BootstrapBlock.data_refcount (always accessible,
     // not dependent on lender's metadata being mapped). See get_refcount_ptr
     // in distributed_backend.hpp.
 
-    SegmentDescriptor() : total_size(0), slab_count(0), crc32(0), ready(0) {
+    SegmentDescriptor() : total_size(0), slab_count(0), provider_node(0), crc32(0), ready(0) {
         name[0] = '\0';
     }
 
@@ -74,6 +81,7 @@ struct SegmentDirectory {
             descs[i].name[0] = '\0';
             descs[i].total_size = 0;
             descs[i].slab_count = 0;
+            descs[i].provider_node = 0;
             descs[i].crc32 = 0;
             descs[i].ready.store(0, std::memory_order_relaxed);
         }

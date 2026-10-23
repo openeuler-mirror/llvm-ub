@@ -366,6 +366,20 @@ struct PosixShmProvider {
         return fd;
     }
 
+    // Single-node provider: node-targeted creation only supports the local
+    // (only) node, encoded as provider_slot_id == 0. Any non-zero target is
+    // an error the caller maps onto its fallback policy
+    // (node_targeted_allocation.md §8).
+    static Result<ShmHandle> shm_try_create_on(const std::string& name, size_t size,
+                                               uint32_t provider_slot_id) {
+        if (provider_slot_id != 0) {
+            LOG_WARN("shm_try_create_on: node-targeted create (slot=" << provider_slot_id
+                     << ") not supported on the single-node POSIX provider");
+            return Error(ErrorKind::Shm, "node-targeted create on single-node provider");
+        }
+        return shm_try_create(name, size);
+    }
+
     static Result<ShmHandle> shm_attach(const std::string& name) {
         LOG_INFO("shm_attach: name=" << name);
         int fd = ::shm_open(name.c_str(), O_RDWR, 0);
