@@ -264,7 +264,7 @@ extern "C" void mon8_c_api(const std::string& heap) {
 // ---------------------------------------------------------------------------
 constexpr const char* kUbseHeap = "mon-ubse";
 constexpr uint32_t kRemoteNode = 1;
-constexpr int kPollSecs = 30;
+constexpr int kPollSecs = 120;
 
 static bool wait_ack_marker() {
     using P = uballoc::UBShmProvider;
