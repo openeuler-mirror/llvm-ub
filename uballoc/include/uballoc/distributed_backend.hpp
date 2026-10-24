@@ -2118,7 +2118,26 @@ public:
         return res;
     }
 
-    // detach_with_refcount — close fd, decrement, conditional detach (§2c, §9a)
+    // Published registry shm helpers (million_type_id_registry.md §2.3).
+    std::string registry_shm_name() const {
+        return ShmProviderT::shm_registry_name(heap_id_);
+    }
+
+    Result<ShmHandle> shm_try_create_registry(const std::string& name, size_t size) {
+        return ShmProviderT::shm_try_create(name, size);
+    }
+
+    Result<ShmHandle> shm_attach_registry(const std::string& name) {
+        return ShmProviderT::shm_attach(name);
+    }
+
+    int registry_handle_fd(ShmHandle h) {
+        return ShmProviderT::shm_handle_fd(h);
+    }
+
+    void registry_close(ShmHandle h) {
+        ShmProviderT::shm_close(h);
+    }
     // Used by detach_all_regions, error paths in attach/create, and the
     // uffd-attached cleanup. The handle's fd is always closed; the
     // shm_detach_by_name is only called when refcount==0 (last on node).

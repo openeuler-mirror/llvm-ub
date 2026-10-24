@@ -36,6 +36,10 @@ void uballoc_free(void *pointer) {
     uballoc::get_global_allocator().free(pointer);
 }
 
+bool uballoc_unpublish_by_type(uint32_t type_id) {
+    return uballoc::get_global_allocator().unpublish_by_type(type_id);
+}
+
 void *uballoc_realloc(void *pointer, size_t size) {
     return uballoc::get_global_allocator().realloc(pointer, size);
 }

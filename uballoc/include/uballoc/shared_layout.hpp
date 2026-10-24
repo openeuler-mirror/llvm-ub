@@ -26,7 +26,7 @@ inline size_t align_up(size_t val, size_t align) {
 
 struct SharedLayout {
     static constexpr uint64_t MAGIC = 0x55BA110C00001ULL;
-    static constexpr uint32_t LAYOUT_VERSION = 9;
+    static constexpr uint32_t LAYOUT_VERSION = 10;
 
     uint64_t magic;
     uint32_t layout_version;
@@ -76,7 +76,6 @@ struct DistributedSharedRegionLayout {
     size_t large_shared_offset;
     size_t huge_shared_offset;
     size_t owned_array_offset;
-    size_t published_registry_offset;
     size_t seg_dir_small_offset;
     size_t seg_dir_large_offset;
     size_t seg_dir_huge_offset;
@@ -123,8 +122,6 @@ inline DistributedSharedRegionLayout compute_distributed_shared_region_layout(
     layout.owned_array_offset = align_up(off, alignof(AllocatorOwned));
     off = layout.owned_array_offset + owned_size;
 
-    layout.published_registry_offset = align_up(off, alignof(PublishedEntry));
-    off = layout.published_registry_offset + sizeof(PublishedRegistry);
 
     // type_id_map is now in the BootstrapBlock, not in per-process metadata.
     // No offset needed here.

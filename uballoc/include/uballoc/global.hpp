@@ -73,8 +73,12 @@ private:
     char* data_huge_base_;
     std::array<char*, MAX_PROCESSES> data_huge_base_ptrs_;
 
-    std::array<PublishedRegistry*, MAX_PROCESSES> published_registry_ptrs_;
-    TypeIdMap* type_id_map_;
+    // Million-type-id published registry (million_type_id_registry.md).
+    // Single shared direct-indexed array in a dedicated shm.
+    PublishedEntryV2* registry_entries_ = nullptr;
+    uint64_t registry_max_type_id_ = 0;
+    void* registry_mapping_ = nullptr;  // mmap result for cleanup
+    typename BackendT::ShmHandle registry_handle_ = BackendT::INVALID_HANDLE;
 
     std::unique_ptr<ReclaimThread> reclaim_thread_;
     pid_t reclaim_creator_pid_ = 0;
@@ -93,7 +97,8 @@ public:
                         total_processes_(1), rank_(0),
                         num_cores_(MAX_NUM_CORES),
                         data_huge_base_(nullptr),
-                        type_id_map_(nullptr) {
+                        registry_entries_(nullptr),
+                        registry_max_type_id_(0) {
         instance_ = this;
         for (size_t i = 0; i < MAX_PROCESSES; ++i) {
             distributed_shared_ptrs_[i] = nullptr;
@@ -103,7 +108,7 @@ public:
             distributed_owned_arrays_[i] = nullptr;
             help_array_ptrs_[i] = nullptr;
             help_data_ptrs_[i] = nullptr;
-            published_registry_ptrs_[i] = nullptr;
+            // (registry_ptrs_ no longer needed — single shared registry)
             data_huge_base_ptrs_[i] = nullptr;
         }
         cumulative_small_[0] = 0;
@@ -295,17 +300,8 @@ public:
             layout->seg_dir_large_offset = own_offsets.seg_dir_large_offset;
             layout->seg_dir_huge_offset = own_offsets.seg_dir_huge_offset;
 
-            // type_id_map is now in BootstrapBlock, initialized in
-            // bootstrap_join (P0) or available immediately (P1+ attaches
-            // bootstrap). No need to initialize it in metadata.
-            if (rank == 0) {
-                // Initialize type_id_map in bootstrap block
-                auto* tid_map = &backend_.bootstrap_block_->type_id_map;
-                for (int i = 0; i < TypeIdMap::MAX_TYPE_IDS; ++i) {
-                    tid_map->owner_process[i].store(
-                        TypeIdMap::UNOWNED, std::memory_order_relaxed);
-                }
-            }
+            // Published registry is in a dedicated shm, not in per-process
+            // metadata — initialized in init_published_registry().
 
             for (int b = 0; b < 3; ++b) {
                 SegmentDirectory* dir = backend_.segment_directory(rank, b);
@@ -415,18 +411,11 @@ public:
 		//  write_heartbeat().
         backend_.write_heartbeat();
 
-        {
-            auto* reg = published_registry_ptrs_[rank];
-            if (reg) {
-                for (int i = 0; i < PublishedRegistry::MAX_ENTRIES; ++i) {
-                    reg->entries[i].address.store(nullptr, std::memory_order_relaxed);
-                    reg->entries[i].size.store(0, std::memory_order_relaxed);
-                    reg->entries[i].type_id.store(0, std::memory_order_relaxed);
-                    reg->entries[i].active.store(PUBLISHED_INACTIVE, std::memory_order_relaxed);
-                }
-                reg->next_slot.store(0, std::memory_order_relaxed);
-            }
-        }
+        // Published registry: create (P0) or attach (non-P0) the dedicated
+        // registry shm. Must run AFTER wire_up_process (needs bootstrap)
+        // and AFTER init_reclaim_params (P0's capacity is published to the
+        // bootstrap block for late joiners).
+        init_published_registry();
 
         small_slab_ = Slab<Small>();
         large_slab_ = Slab<Large>();
@@ -639,15 +628,8 @@ public:
         help_array_ptrs_[k] = reinterpret_cast<HelpArray*>(
             metadata_base + ksl.allocator_shared_offset + sizeof(typename BackendT::AllocatorShared));
         help_data_ptrs_[k] = k_help_data;
-        published_registry_ptrs_[k] = reinterpret_cast<PublishedRegistry*>(
-            metadata_base + ksl.published_registry_offset);
-
-        // type_id_map is now in the BootstrapBlock, not in per-process
-        // metadata. Set it once from bootstrap_block_ (available to all
-        // processes without attaching P0's metadata).
-        if (k == 0 && !type_id_map_) {
-            type_id_map_ = &backend_.bootstrap_block_->type_id_map;
-        }
+        // (Published registry is in a dedicated shm, not per-process
+        // metadata — see init_published_registry. No per-k setup needed.)
 
         small_shared_ptrs_[k]->set_cross_free(k, &small_shared_ptrs_[k]->free);
         small_shared_ptrs_[k]->rank_ = k;
@@ -876,7 +858,7 @@ public:
         initialized_ = false;
         total_processes_ = 1;
         rank_ = 0;
-        type_id_map_ = nullptr;
+        cleanup_published_registry();
         for (size_t i = 0; i < MAX_PROCESSES; ++i) {
             distributed_shared_ptrs_[i] = nullptr;
             small_shared_ptrs_[i] = nullptr;
@@ -885,7 +867,7 @@ public:
             distributed_owned_arrays_[i] = nullptr;
             help_array_ptrs_[i] = nullptr;
             help_data_ptrs_[i] = nullptr;
-            published_registry_ptrs_[i] = nullptr;
+            // (registry_ptrs_ no longer needed — single shared registry)
             data_huge_base_ptrs_[i] = nullptr;
         }
         cumulative_small_[0] = cumulative_small_[1] = 0;
@@ -1598,17 +1580,7 @@ public:
             // If attach_new_processes released Pk's metadata (slot cleared),
             // clear dangling shared pointers so future check_remote_segments
             // calls will re-wire Pk if it rejoins (new process reclaims slot).
-            // Also clear published_registry_ptrs_ to prevent lookup_by_type
-            // from dereferencing a dangling pointer (causes SIGSEGV).
-            if (small_shared_ptrs_[k] != nullptr &&
-                backend_.metadata_address(k) == nullptr) {
-                small_shared_ptrs_[k] = nullptr;
-                large_shared_ptrs_[k] = nullptr;
-                huge_shared_ptrs_[k] = nullptr;
-                help_array_ptrs_[k] = nullptr;
-                help_data_ptrs_[k] = nullptr;
-                published_registry_ptrs_[k] = nullptr;
-            }
+            // (registry pointers cleared in cleanup_published_registry)
             if (small_shared_ptrs_[k] != nullptr) continue;
             if (backend_.metadata_address(k) == nullptr) continue;
             wire_up_process(k);
@@ -1777,35 +1749,194 @@ public:
         return reinterpret_cast<void*>(aligned);
     }
 
+    // ------------------------------------------------------------------
+    // Million-type-id published registry (million_type_id_registry.md).
+    // ------------------------------------------------------------------
+
+    void init_published_registry() {
+        if (!backend_.bootstrap_block_) return;
+
+        if (rank_ == 0) {
+            const char* env = std::getenv("UBALLOC_MAX_TYPE_ID");
+            uint64_t cap = DEFAULT_MAX_TYPE_ID;
+            if (env) {
+                long v = std::atol(env);
+                if (v > 0 && v <= 0xFFFFFFFFULL) {
+                    cap = static_cast<uint64_t>(v);
+                } else {
+                    LOG_WARN("UBALLOC_MAX_TYPE_ID invalid, using default");
+                }
+            }
+            backend_.bootstrap_block_->registry_max_type_id.store(
+                cap, std::memory_order_release);
+        }
+
+        uint64_t cap = 0;
+        for (int i = 0; i < 30000; ++i) {
+            cap = backend_.bootstrap_block_->registry_max_type_id.load(
+                std::memory_order_acquire);
+            if (cap > 0) break;
+            ::usleep(1000);
+        }
+        if (cap == 0) {
+            LOG_ERROR("init_published_registry: P0 did not publish capacity");
+            return;
+        }
+        registry_max_type_id_ = cap;
+
+        std::string name = backend_.registry_shm_name();
+        uintptr_t registry_va = backend_.va_base_ + REGISTRY_OFFSET;
+        size_t shm_size = cap * sizeof(PublishedEntryV2);
+        size_t effective_size = ((shm_size + 0xFFFFFULL) & ~0xFFFFFULL);
+
+        if (rank_ == 0) {
+            auto res = backend_.shm_try_create_registry(name, effective_size);
+            if (is_err(res)) {
+                auto err = unwrap_err(res);
+                if (err.kind == ErrorKind::ShmExists) {
+                    LOG_WARN("init_published_registry: stale shm, attaching");
+                    res = backend_.shm_attach_registry(name);
+                    if (is_err(res)) {
+                        LOG_ERROR("init_published_registry: attach failed");
+                        return;
+                    }
+                } else {
+                    LOG_ERROR("init_published_registry: create failed");
+                    return;
+                }
+            }
+            registry_handle_ = unwrap(res);
+
+            void* mapped = ::mmap(reinterpret_cast<void*>(registry_va),
+                                  effective_size,
+                                  PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  backend_.registry_handle_fd(registry_handle_), 0);
+            if (mapped == MAP_FAILED) {
+                LOG_ERROR("init_published_registry: mmap failed errno=" << errno);
+                backend_.registry_close(registry_handle_);
+                registry_handle_ = BackendT::INVALID_HANDLE;
+                return;
+            }
+            registry_mapping_ = mapped;
+            // Zero the registry on every P0 init (matches the old per-process
+            // registry behavior: fresh start = clean registry). Entry
+            // persistence across process restarts is a future optimization.
+            std::memset(mapped, 0, effective_size);
+            registry_entries_ = reinterpret_cast<PublishedEntryV2*>(mapped);
+            backend_.bootstrap_block_->registry_ready.store(1, std::memory_order_release);
+            LOG_INFO("init_published_registry: P0 created, capacity=" << cap);
+        } else {
+            for (int i = 0; i < 30000; ++i) {
+                if (backend_.bootstrap_block_->registry_ready.load(
+                        std::memory_order_acquire) == 1) break;
+                ::usleep(1000);
+            }
+            if (backend_.bootstrap_block_->registry_ready.load(
+                    std::memory_order_acquire) != 1) {
+                LOG_ERROR("init_published_registry: P0 registry not ready");
+                return;
+            }
+
+            auto res = backend_.shm_attach_registry(name);
+            if (is_err(res)) {
+                LOG_ERROR("init_published_registry: attach failed");
+                return;
+            }
+            registry_handle_ = unwrap(res);
+
+            void* mapped = ::mmap(reinterpret_cast<void*>(registry_va),
+                                  effective_size,
+                                  PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  backend_.registry_handle_fd(registry_handle_), 0);
+            if (mapped == MAP_FAILED) {
+                LOG_ERROR("init_published_registry: mmap failed errno=" << errno);
+                backend_.registry_close(registry_handle_);
+                registry_handle_ = BackendT::INVALID_HANDLE;
+                return;
+            }
+            registry_mapping_ = mapped;
+            registry_entries_ = reinterpret_cast<PublishedEntryV2*>(mapped);
+            LOG_INFO("init_published_registry: rank " << rank_ << " attached");
+        }
+    }
+
+    void cleanup_published_registry() {
+        if (registry_mapping_) {
+            size_t effective_size = ((registry_max_type_id_ * sizeof(PublishedEntryV2)
+                                      + 0xFFFFFULL) & ~0xFFFFFULL);
+            ::munmap(registry_mapping_, effective_size);
+            registry_mapping_ = nullptr;
+        }
+        if (registry_handle_ != BackendT::INVALID_HANDLE) {
+            backend_.registry_close(registry_handle_);
+            registry_handle_ = BackendT::INVALID_HANDLE;
+        }
+        registry_entries_ = nullptr;
+        registry_max_type_id_ = 0;
+    }
+
     int publish(void* ptr, size_t size, uint32_t type_id) {
         init();
         if (!initialized_ || total_processes_ <= 1) return -1;
+        if (!registry_entries_ || type_id >= registry_max_type_id_) return -1;
 
-        auto* reg = published_registry_ptrs_[rank_];
-        if (!reg) return -1;
+        uint64_t addr_offset =
+            reinterpret_cast<uintptr_t>(ptr) - backend_.va_base_;
 
-        uint32_t slot = reg->next_slot.fetch_add(1, std::memory_order_relaxed);
-        if (slot >= PublishedRegistry::MAX_ENTRIES) {
-            reg->next_slot.store(PublishedRegistry::MAX_ENTRIES, std::memory_order_relaxed);
-            return -1;
+        uint64_t claimed = addr_offset
+            | (static_cast<uint64_t>(rank_) << PUBLISHED_OWNER_SHIFT);
+        uint64_t expected = 0;
+        if (!registry_entries_[type_id].meta.compare_exchange_strong(
+                expected, claimed,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return publish_conflict_cleanup(ptr, size, type_id, expected);
         }
 
-        if (type_id_map_ && type_id < TypeIdMap::MAX_TYPE_IDS) {
-            int32_t expected = TypeIdMap::UNOWNED;
-            if (!type_id_map_->owner_process[type_id].compare_exchange_strong(
-                    expected, static_cast<int32_t>(rank_),
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                reg->next_slot.fetch_sub(1, std::memory_order_relaxed);
-                return -1;
+        registry_entries_[type_id].size.store(size, std::memory_order_relaxed);
+        registry_entries_[type_id].meta.store(
+            claimed | PUBLISHED_ACTIVE_BIT, std::memory_order_release);
+
+        return static_cast<int>(type_id);
+    }
+
+    int publish_conflict_cleanup(void* ptr, size_t size,
+                                 uint32_t type_id, uint64_t stale_meta) {
+        int owner = static_cast<int>(
+            (stale_meta & PUBLISHED_OWNER_MASK) >> PUBLISHED_OWNER_SHIFT);
+        if (owner == rank_) return -1;
+
+        if (backend_.bootstrap_block_ && owner >= 0 &&
+            owner < static_cast<int>(MAX_PROCESSES)) {
+            int32_t pid = backend_.bootstrap_block_->slots[owner].pid.load(
+                std::memory_order_acquire);
+            if (pid != 0 && ::kill(pid, 0) == -1 && errno == ESRCH) {
+                uint64_t expected = stale_meta;
+                if (registry_entries_[type_id].meta.compare_exchange_strong(
+                        expected, 0,
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    LOG_INFO("publish: reclaimed type_id " << type_id
+                             << " from dead rank " << owner);
+                    return publish(ptr, size, type_id);
+                }
             }
         }
+        return -1;
+    }
 
-        reg->entries[slot].address.store(ptr, std::memory_order_relaxed);
-        reg->entries[slot].size.store(size, std::memory_order_relaxed);
-        reg->entries[slot].type_id.store(type_id, std::memory_order_relaxed);
-        reg->entries[slot].active.exchange(PUBLISHED_ACTIVE, std::memory_order_acq_rel);
+    bool unpublish_by_type(uint32_t type_id) {
+        if (!initialized_ || !registry_entries_) return false;
+        if (type_id >= registry_max_type_id_) return false;
 
-        return static_cast<int>(slot);
+        uint64_t m = registry_entries_[type_id].meta.load(
+            std::memory_order_acquire);
+        if (!(m & PUBLISHED_ACTIVE_BIT)) return false;
+
+        int owner = static_cast<int>(
+            (m & PUBLISHED_OWNER_MASK) >> PUBLISHED_OWNER_SHIFT);
+        if (owner != rank_) return false;
+
+        registry_entries_[type_id].meta.store(0, std::memory_order_release);
+        return true;
     }
 
     bool unpublish(void* ptr) {
@@ -1813,24 +1944,21 @@ public:
     }
 
     bool unpublish(void* ptr, int owner_pid) {
-        if (!initialized_ || total_processes_ <= 1) return false;
-        if (owner_pid < 0 || owner_pid >= total_processes_) return false;
+        if (!ptr || !initialized_ || !registry_entries_) return false;
 
-        auto* reg = published_registry_ptrs_[owner_pid];
-        if (!reg) return false;
+        for (uint32_t id = 0; id < registry_max_type_id_; ++id) {
+            uint64_t m = registry_entries_[id].meta.load(
+                std::memory_order_acquire);
+            if (!(m & PUBLISHED_ACTIVE_BIT)) continue;
 
-        uint32_t limit = reg->next_slot.load(std::memory_order_acquire);
-        for (uint32_t i = 0; i < limit && i < PublishedRegistry::MAX_ENTRIES; ++i) {
-            if (reg->entries[i].address.load(std::memory_order_relaxed) == ptr &&
-                reg->entries[i].active.load(std::memory_order_acquire) == PUBLISHED_ACTIVE) {
-                uint32_t type_id = reg->entries[i].type_id.load(std::memory_order_relaxed);
-                if (type_id_map_ && type_id < TypeIdMap::MAX_TYPE_IDS) {
-                    int32_t expected = static_cast<int32_t>(owner_pid);
-                    type_id_map_->owner_process[type_id].compare_exchange_strong(
-                        expected, TypeIdMap::UNOWNED,
-                        std::memory_order_acq_rel, std::memory_order_acquire);
-                }
-                reg->entries[i].active.exchange(PUBLISHED_INACTIVE, std::memory_order_acq_rel);
+            int owner = static_cast<int>(
+                (m & PUBLISHED_OWNER_MASK) >> PUBLISHED_OWNER_SHIFT);
+            if (owner != owner_pid) continue;
+
+            void* addr = reinterpret_cast<void*>(
+                backend_.va_base_ + (m & PUBLISHED_ADDR_MASK));
+            if (addr == ptr) {
+                registry_entries_[id].meta.store(0, std::memory_order_release);
                 return true;
             }
         }
@@ -1840,22 +1968,23 @@ public:
     PublishedInfo lookup_by_address(void* ptr) {
         init();
         PublishedInfo result;
-        if (!initialized_ || total_processes_ <= 1) return result;
+        if (!ptr || !initialized_ || !registry_entries_) return result;
 
-        for (int k = 0; k < total_processes_; ++k) {
-            auto* reg = published_registry_ptrs_[k];
-            if (!reg) continue;
+        for (uint32_t id = 0; id < registry_max_type_id_; ++id) {
+            uint64_t m = registry_entries_[id].meta.load(
+                std::memory_order_acquire);
+            if (!(m & PUBLISHED_ACTIVE_BIT)) continue;
 
-            uint32_t limit = reg->next_slot.load(std::memory_order_acquire);
-            for (uint32_t i = 0; i < limit && i < PublishedRegistry::MAX_ENTRIES; ++i) {
-                if (reg->entries[i].address.load(std::memory_order_relaxed) == ptr &&
-                    reg->entries[i].active.load(std::memory_order_acquire) == PUBLISHED_ACTIVE) {
-                    result.address = reg->entries[i].address.load(std::memory_order_relaxed);
-                    result.size = reg->entries[i].size.load(std::memory_order_relaxed);
-                    result.type_id = reg->entries[i].type_id.load(std::memory_order_relaxed);
-                    result.owner_process = k;
-                    return result;
-                }
+            void* addr = reinterpret_cast<void*>(
+                backend_.va_base_ + (m & PUBLISHED_ADDR_MASK));
+            if (addr == ptr) {
+                result.address = addr;
+                result.size = registry_entries_[id].size.load(
+                    std::memory_order_relaxed);
+                result.type_id = id;
+                result.owner_process = static_cast<int>(
+                    (m & PUBLISHED_OWNER_MASK) >> PUBLISHED_OWNER_SHIFT);
+                return result;
             }
         }
         return result;
@@ -1864,53 +1993,28 @@ public:
     PublishedInfo lookup_by_type(uint32_t type_id) {
         init();
         PublishedInfo result;
-        if (!initialized_ || total_processes_ <= 1) {
-            LOG_TRACE("lookup_by_type(" << type_id << "): not initialized");
-            return result;
-        }
-        if (!type_id_map_ || type_id >= TypeIdMap::MAX_TYPE_IDS) {
-            LOG_TRACE("lookup_by_type(" << type_id << "): type_id_map_=" << type_id_map_ << " type_id=" << type_id);
-            return result;
-        }
+        if (!initialized_ || !registry_entries_) return result;
+        if (type_id >= registry_max_type_id_) return result;
 
-        int32_t owner = type_id_map_->owner_process[type_id].load(std::memory_order_acquire);
-        if (owner == TypeIdMap::UNOWNED) {
-            check_remote_segments();
-            owner = type_id_map_->owner_process[type_id].load(std::memory_order_acquire);
-            if (owner == TypeIdMap::UNOWNED) {
-                LOG_TRACE("lookup_by_type(" << type_id << "): UNOWNED");
-                return result;
-            }
-        }
+        uint64_t m = registry_entries_[type_id].meta.load(
+            std::memory_order_acquire);
+        if (!(m & PUBLISHED_ACTIVE_BIT)) return result;
 
-        int k = static_cast<int>(owner);
-        if (k < 0 || k >= total_processes_) {
-            LOG_TRACE("lookup_by_type(" << type_id << "): invalid owner k=" << k);
-            return result;
-        }
+        int owner = static_cast<int>(
+            (m & PUBLISHED_OWNER_MASK) >> PUBLISHED_OWNER_SHIFT);
 
-        if (k != rank_) {
+        // Ensure the owner's data segments are attached before the
+        // caller dereferences the returned pointer.
+        if (owner != rank_) {
             check_remote_segments();
         }
 
-        auto* reg = published_registry_ptrs_[k];
-        if (!reg) {
-            LOG_TRACE("lookup_by_type(" << type_id << "): registry null for k=" << k);
-            return result;
-        }
-
-        uint32_t limit = reg->next_slot.load(std::memory_order_acquire);
-        LOG_TRACE("lookup_by_type(" << type_id << "): owner=" << owner << " next_slot=" << limit);
-        for (uint32_t i = 0; i < limit && i < PublishedRegistry::MAX_ENTRIES; ++i) {
-            if (reg->entries[i].type_id.load(std::memory_order_relaxed) == type_id &&
-                reg->entries[i].active.load(std::memory_order_acquire) == PUBLISHED_ACTIVE) {
-                result.address = reg->entries[i].address.load(std::memory_order_relaxed);
-                result.size = reg->entries[i].size.load(std::memory_order_relaxed);
-                result.type_id = reg->entries[i].type_id.load(std::memory_order_relaxed);
-                result.owner_process = k;
-                return result;
-            }
-        }
+        result.address = reinterpret_cast<void*>(
+            backend_.va_base_ + (m & PUBLISHED_ADDR_MASK));
+        result.size = registry_entries_[type_id].size.load(
+            std::memory_order_relaxed);
+        result.type_id = type_id;
+        result.owner_process = owner;
         return result;
     }
 
@@ -1943,7 +2047,6 @@ public:
         distributed_owned_arrays_[dead_pid] = nullptr;
         help_array_ptrs_[dead_pid] = nullptr;
         help_data_ptrs_[dead_pid] = nullptr;
-        published_registry_ptrs_[dead_pid] = nullptr;
     }
 
     bool is_owner() const { return backend_.is_owner_impl(); }
@@ -2066,6 +2169,10 @@ inline int publish(void* ptr, size_t size, uint32_t type_id) {
 
 inline bool unpublish(void* ptr) {
     return get_global_allocator().unpublish(ptr);
+}
+
+inline bool unpublish_by_type(uint32_t type_id) {
+    return get_global_allocator().unpublish_by_type(type_id);
 }
 
 inline bool unpublish(void* ptr, int owner_pid) {

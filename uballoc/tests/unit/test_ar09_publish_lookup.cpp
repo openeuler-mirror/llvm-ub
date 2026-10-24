@@ -250,21 +250,24 @@ void dt09_5_registry_exhaustion(const std::string& heap_id) {
             blocks.push_back(p);
         }
 
-        // 257th publish: registry exhausted (next_slot == 256).
+        // V2: capacity is 1M (default) — type_id 256 is valid.
+        // Test that a type_id beyond the capacity fails.
         {
             void* q = uballoc::malloc(32);
             assert(q);
-            assert(uballoc::publish(q, 32, 256) == -1);
+            // 1M default capacity — type_id 1M is out of range.
+            assert(uballoc::publish(q, 32, 1000000) == -1);
             uballoc::free(q);
         }
 
-        // Sticky exhaustion: unpublish frees the CAS ownership of type_id 0
-        // but recycles no registry slot, so a re-publish still fails.
-        assert(uballoc::unpublish(blocks[0]));
+        // V2: unpublish frees the slot for immediate reuse (not sticky).
+        assert(uballoc::unpublish_by_type(0));
         {
             void* q = uballoc::malloc(32);
             assert(q);
-            assert(uballoc::publish(q, 32, 0) == -1);
+            // Re-publish of type_id 0 should succeed (slot recycled).
+            assert(uballoc::publish(q, 32, 0) >= 0);
+            uballoc::unpublish_by_type(0);
             uballoc::free(q);
         }
 
@@ -379,9 +382,13 @@ void dt09_7_lookup_by_address(const std::string& heap_id) {
         ::close(p2_to_p1[0]);
         auto* remote = reinterpret_cast<void*>(v);
 
-        // Phase 1 — scan-only: published_registry_ptrs_[2] is nullptr
+        // Phase 1 — with the shared registry (V2), entries are visible
+        // immediately (no per-process lazy attach). The entry should be
+        // found even before lookup_by_type triggers segment attach.
         auto pre = uballoc::lookup_by_address(remote);
-        assert(pre.owner_process == -1);
+        // (Old V1 behavior: owner_process == -1 until metadata attached.
+        //  V2: entry is in the shared registry, visible to all processes.)
+        assert(pre.owner_process >= 0);
 
         // Phase 2 — lookup_by_type triggers check_remote_segments.
         auto via_type = uballoc::lookup_by_type(TID_C);

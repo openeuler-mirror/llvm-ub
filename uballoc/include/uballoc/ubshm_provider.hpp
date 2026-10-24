@@ -127,6 +127,10 @@ struct UBShmProvider {
         return name;
     }
 
+    static std::string shm_registry_name(const std::string& heap_id) {
+        return "ub-" + heap_id + "-registry";
+    }
+
     static Result<ShmHandle> shm_create(const std::string&name, size_t size) {
         uint8_t usr_info[UBS_MEM_MAX_USR_INFO_LEN] = {0};
 
