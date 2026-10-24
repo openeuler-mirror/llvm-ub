@@ -113,7 +113,12 @@ struct BootstrapBlock {
     // block (not in any process's metadata) so it is always available
     // to all processes without attaching P0's metadata. This prevents
     // SIGSEGV when attach_new_processes releases P0's metadata.
-    TypeIdMap type_id_map;
+    // Published registry discovery (replaces the old TypeIdMap — the
+    // type_id → owner mapping is now in the registry's meta word).
+    // P0 creates the registry shm and sets these fields; other processes
+    // read them to attach the registry at the fixed VA offset.
+    std::atomic<uint32_t> registry_ready;        // 1 when the registry shm is initialized
+    std::atomic<uint64_t> registry_max_type_id;  // capacity (entry count)
 
     // TEMPORARY: Data segment refcount, indexed as
     // data_refcount[lender_rank][bracket][seg_idx][node_index].
@@ -160,8 +165,16 @@ static constexpr uintptr_t DATA_SMALL_STRIDE  = MAX_PROCESSES * PROCESS_STRIDE_S
 static constexpr uintptr_t DATA_LARGE_STRIDE  = MAX_PROCESSES * PROCESS_STRIDE_LARGE;   // 8 TB
 static constexpr uintptr_t DATA_HUGE_STRIDE   = MAX_PROCESSES * PROCESS_STRIDE_HUGE;     // 12 TB
 
+// Published registry: dedicated shm after the Huge data area.
+// The registry is a direct-indexed array of PublishedEntryV2 (16 B each).
+// Capacity is configurable (UBALLOC_MAX_TYPE_ID, default 1M); the VA
+// reservation covers the maximum practical capacity (REGISTRY_VA_SIZE).
+static constexpr uintptr_t REGISTRY_OFFSET =
+    METADATA_STRIDE + DATA_SMALL_STRIDE + DATA_LARGE_STRIDE + DATA_HUGE_STRIDE;
+
 static constexpr size_t VA_RESERVATION_SIZE =
-    METADATA_STRIDE + DATA_SMALL_STRIDE + DATA_LARGE_STRIDE + DATA_HUGE_STRIDE;  // ~28 TB
+    METADATA_STRIDE + DATA_SMALL_STRIDE + DATA_LARGE_STRIDE + DATA_HUGE_STRIDE
+    + REGISTRY_VA_SIZE;  // ~28 TB + 4 GB
 
 // Default base — used as fallback if all candidates are exhausted (per-segment mode).
 static constexpr uintptr_t DEFAULT_VA_BASE = 0x200000000000ULL;
@@ -328,6 +341,10 @@ struct PosixShmProvider {
             name += "-s" + std::to_string(segment_idx);
         }
         return name;
+    }
+
+    static std::string shm_registry_name(const std::string& heap_id) {
+        return "/" + heap_id + "-registry";
     }
 
     static Result<ShmHandle> shm_create(const std::string& name, size_t size) {

@@ -54,6 +54,12 @@ void *uballoc_malloc(size_t size);
 void uballoc_free(void *pointer);
 
 /**
+ * Unpublish a previously published region by its type_id (O(1)).
+ * Only the publishing process can unpublish. Returns true on success.
+ */
+bool uballoc_unpublish_by_type(uint32_t type_id);
+
+/**
  * Node-targeted allocation: allocate memory whose physical backing is
  * `node_index` (a logical node id; see uballoc_node_index_local()). When
  * this process already owns free capacity on that node it is reused;
