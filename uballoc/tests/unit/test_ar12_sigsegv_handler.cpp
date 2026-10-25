@@ -134,6 +134,7 @@ void dt12_1_handler_recovers_fault(const std::string& heap_id) {
             assert(eager[i] == 0xA5);
         }
 
+        uballoc::reset();
         _exit(0);
     }
 
@@ -154,6 +155,7 @@ void dt12_1_handler_recovers_fault(const std::string& heap_id) {
 
     uballoc::unpublish(p);
     uballoc::free(p);
+    uballoc::reset();
     std::cout << "  OK: remap branch (attached==1) + eager CAS branch "
                  "(attached==0) both recovered, data consistent"
               << std::endl;
@@ -371,19 +373,19 @@ int main() {
     cleanup_all_distributed_shms(8, id);
 
     ar_pre_case_cleanup(id);
-    dt12_1_handler_recovers_fault(id + "_1");
-    ar_pre_case_cleanup(id + "_1");
-    dt12_2_wild_pointer_crashes(id + "_2");
-    ar_pre_case_cleanup(id + "_2");
-    dt12_3_idempotent_install(id + "_3");
-    ar_pre_case_cleanup(id + "_3");
-    dt12_4_no_interference(id + "_4");
-    ar_pre_case_cleanup(id + "_4");
-    dt12_5_disable_restores_default(id + "_5");
-    ar_pre_case_cleanup(id + "_5");
-    dt12_6_soft_reset_uninstalls(id + "_6");
-    ar_pre_case_cleanup(id + "_6");
-    dt12_7_uffd_success_installs_handler(id + "_7");
+    dt12_1_handler_recovers_fault(id);
+    ar_pre_case_cleanup(id);
+    dt12_2_wild_pointer_crashes(id);
+    ar_pre_case_cleanup(id);
+    dt12_3_idempotent_install(id);
+    ar_pre_case_cleanup(id);
+    dt12_4_no_interference(id);
+    ar_pre_case_cleanup(id);
+    dt12_5_disable_restores_default(id);
+    ar_pre_case_cleanup(id);
+    dt12_6_soft_reset_uninstalls(id);
+    ar_pre_case_cleanup(id);
+    dt12_7_uffd_success_installs_handler(id);
 
     cleanup_all_distributed_shms(8, id);
     std::cout << "\n=== AR-12 DT passed ===" << std::endl;

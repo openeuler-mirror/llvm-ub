@@ -14,6 +14,11 @@
  *   DT13-7  R7: disable_userfaultfd + re-enable SIGSEGV mode
  *   DT13-8  R5: eager+uffd coexist (eager segment no uffd fault)
  *   DT13-9  R8: fork child soft_reset → uffd_uninstall (no std::terminate)
+ *
+ * All DT13 cases hard-require uffd. On hardened hosts where uffd is
+ * unavailable (vm.unprivileged_userfaultfd=0 or non-root), the suite
+ * probes once at start, asserts the documented SIGSEGV fallback
+ * (g_uffd_active==false && g_fh_active==true), and skips all cases.
  */
 
 #include "uballoc.hpp"
@@ -55,6 +60,28 @@ static int uffd_data_attached_count() {
 static int uffd_all_attached_count() {
     std::lock_guard<std::mutex> lk(uballoc::g_uffd_attached_mtx);
     return static_cast<int>(uballoc::g_uffd_attached.size());
+}
+
+// Probe whether userfaultfd is available on this host. On hardened kernels
+// (vm.unprivileged_userfaultfd=0 — the openEuler/RHEL default for non-root),
+// the uffd syscall fails and the library degrades to the SIGSEGV handler.
+// All DT13 cases hard-require uffd, so we probe once and skip the entire
+// suite when unavailable, asserting the documented fallback instead.
+static bool uffd_available() {
+    ar_set_heap_id("ar13_probe");
+    ar_parent_init();
+    bool uffd_ok = uballoc::g_uffd_active.load(std::memory_order_acquire);
+    bool fh_ok = uballoc::g_fh_active.load(std::memory_order_acquire);
+    // Documented fallback: uffd unavailable → SIGSEGV handler must be active.
+    assert(fh_ok && "g_fh_active must be true (uffd or SIGSEGV fallback)");
+    if (!uffd_ok) {
+        std::cout << "[probe] uffd unavailable — fallback active"
+                  << " (g_uffd_active=false, g_fh_active=true)" << std::endl;
+    }
+    uballoc::reset();
+    cleanup_all_distributed_shms(static_cast<int>(uballoc::MAX_PROCESSES),
+                                 "ar13_probe");
+    return uffd_ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +163,7 @@ void dt13_2_remote_fault_recovery(const std::string& heap_id) {
 
     uballoc::unpublish(p);
     uballoc::free(p);
+    uballoc::reset();
     std::cout << "  OK: uffd transparent loading — remote segment accessed, data consistent (0xA5)" << std::endl;
 }
 
@@ -214,6 +242,7 @@ void dt13_3_multi_publish_recovery(const std::string& heap_id) {
     uballoc::unpublish(p2);
     uballoc::free(p1);
     uballoc::free(p2);
+    uballoc::reset();
     std::cout << "  OK: two publishes same segment, 1 uffd attach, both data consistent" << std::endl;
 }
 
@@ -282,6 +311,7 @@ void dt13_4_whole_segment_mmap(const std::string& heap_id) {
 
     uballoc::unpublish(p);
     uballoc::free(p);
+    uballoc::reset();
     std::cout << "  OK: first page triggered uffd, second page no new attach (whole-segment mmap)" << std::endl;
 }
 
@@ -485,6 +515,7 @@ void dt13_8_eager_uffd_coexist(const std::string& heap_id) {
 
     uballoc::unpublish(p);
     uballoc::free(p);
+    uballoc::reset();
     std::cout << "  OK: eager-attached segment accessed with no uffd fault (g_uffd_attached unchanged)" << std::endl;
 }
 
@@ -536,24 +567,35 @@ void dt13_9_fork_child_uninstall(const std::string& heap_id) {
 
 int main() {
     std::string id = ar_heap_id("ar13");
-    cleanup_all_distributed_shms(static_cast<int>(uballoc::MAX_PROCESSES), id);
+
+    if (!uffd_available()) {
+        std::cout << "[AR-13] SKIP all DT13 cases: userfaultfd unavailable on"
+                     " this host (vm.unprivileged_userfaultfd=0 or non-root)."
+                  << std::endl;
+        std::cout << "  Verified fallback: g_uffd_active=false,"
+                     "g_fh_active=true (SIGSEGV handler active)."
+                  << std::endl;
+        std::cout << "\n=== AR-13 DT skipped (uffd unavailable,"
+                     " fallback verified) ===" << std::endl;
+        return 0;
+    }
 
     ar_pre_case_cleanup(id);
-    dt13_1_uffd_enable(id + "_1");
-    ar_pre_case_cleanup(id + "_1");
-    dt13_2_remote_fault_recovery(id + "_2");
-    ar_pre_case_cleanup(id + "_2");
-    dt13_3_multi_publish_recovery(id + "_3");
-    ar_pre_case_cleanup(id + "_3");
-    dt13_4_whole_segment_mmap(id + "_4");
-    ar_pre_case_cleanup(id + "_4");
-    dt13_5_6_seg_not_in_dir(id + "_5");
-    ar_pre_case_cleanup(id + "_5");
-    dt13_7_disable_degrades_to_sigsegv(id + "_7");
-    ar_pre_case_cleanup(id + "_7");
-    dt13_8_eager_uffd_coexist(id + "_8");
-    ar_pre_case_cleanup(id + "_8");
-    dt13_9_fork_child_uninstall(id + "_9");
+    dt13_1_uffd_enable(id);
+    ar_pre_case_cleanup(id);
+    dt13_2_remote_fault_recovery(id);
+    ar_pre_case_cleanup(id);
+    dt13_3_multi_publish_recovery(id);
+    ar_pre_case_cleanup(id);
+    dt13_4_whole_segment_mmap(id);
+    ar_pre_case_cleanup(id);
+    dt13_5_6_seg_not_in_dir(id);
+    ar_pre_case_cleanup(id);
+    dt13_7_disable_degrades_to_sigsegv(id);
+    ar_pre_case_cleanup(id);
+    dt13_8_eager_uffd_coexist(id);
+    ar_pre_case_cleanup(id);
+    dt13_9_fork_child_uninstall(id);
 
     cleanup_all_distributed_shms(static_cast<int>(uballoc::MAX_PROCESSES), id);
     std::cout << "\n=== AR-13 DT passed ===" << std::endl;
