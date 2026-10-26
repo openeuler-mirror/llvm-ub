@@ -22,6 +22,21 @@ option(UBALLOC_RECOVER_CAS "Enable detectable CAS for recovery" ON)
 option(UBALLOC_RECOVER_LOG "Enable state logging for recovery" ON)
 option(UBALLOC_LOG "Enable distributed path logging" ON)
 
+# UBALLOC_RECOVER_FLUSH must stay OFF for UBSE builds. The flushes execute
+# dc cvac/dsb sy on shared-memory mappings; on cross-node (borrower-side)
+# NC/device mappings that is architecturally UNPREDICTABLE and was
+# confirmed to kill the whole node asynchronously (4/4 reproductions on
+# the 4-node UBSE cluster, pre-!16 builds where a CMake generator-expression
+# bug force-enabled this option). Visibility is provided by the NC mapping
+# itself (writes bypass caches) plus atomics — see !16's removal of the
+# write_heartbeat() flush.
+if(UBALLOC_RECOVER_FLUSH AND UBALLOC_USE_UBSE)
+    message(FATAL_ERROR
+        "UBALLOC_RECOVER_FLUSH=ON is not supported with UBALLOC_USE_UBSE=ON: "
+        "cache maintenance on NC-mapped remote memory asynchronously kills "
+        "the node (observed on real hardware). Use the default OFF.")
+endif()
+
 add_library(uballoc SHARED
     src/uballoc.cpp
     src/uballoc_instances.cpp
