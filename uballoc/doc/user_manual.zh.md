@@ -48,7 +48,7 @@ uballoc分配器的快速入门，包括环境变量配置、双节点示例运�
 |---------|---------|
 | [快速入门](#快速入门) | 介绍uballoc的基本概念、安装部署、环境变量、双节点示例及性能验证，帮助用户快速上手。 |
 | [安装指南](#安装指南) | 详细介绍uballoc的已验证环境、CMake选项、编译产物、分发包生成（tarball）、下游消费方式及卸载方式。 |
-| [API参考](#api参考) | API分为**基础API**（`init`/`malloc`/`malloc_published`/`free`/`realloc`/`lookup_by_type*`/`shm_new`/`shm_delete`，绝大多数应用只需此组）与**可选/高级API**（`memalign`/`publish`/`unpublish`/`lookup_by_address`/`rank`/`total_processes`/`is_owner`/`is_initialized`/`reset`/`finalize`/`enable_*fault_handler`），提供详细说明与使用示例。 |
+| [API参考](#api参考) | API分为**基础API**（`init`/`malloc`/`malloc_published`/`free`/`realloc`/`lookup_by_type*`/`shm_new`/`shm_delete`，绝大多数应用只需此组）与**可选/高级API**（`memalign`/`publish`/`unpublish`/`unpublish_by_type`/`lookup_by_address`/`rank`/`total_processes`/`is_owner`/`is_initialized`/`reset`/`finalize`/`enable_*fault_handler`），提供详细说明与使用示例。 |
 | [常见问题](#常见问题) | 汇总用户高频关注的行为语义与使用约束，涵盖`realloc`缩容语义、发布/查找的进程生命周期要求、跨进程释放限制等。 |
 
 ## 贡献声明
@@ -348,6 +348,7 @@ UBALLOC_HEAP_ID=myheap ./scripts/cleanup_shms_ub.sh     # 指定 heap_id
 | `UBALLOC_RECLAIM_SCAN_INTERVAL_MS` | ASYNC模式后台线程定时扫描间隔（毫秒） | `5000` | 任意正整数 |
 | `UBALLOC_RECLAIM_STATS` | 内存统计开关；设为0关闭热路径字节计数（零开销） | `1` | `0`/`1` |
 | `UBALLOC_RECLAIM_LOG_STATS_INTERVAL` | ASYNC模式`[RECLAIM-STATS]`日志输出间隔（每N轮后台扫描输出一次） | `30` | 任意正整数 |
+| `UBALLOC_MAX_TYPE_ID` | 发布注册表容量（type_id 条目数，每条 16 字节）。P0 在 init 时读取并按此容量创建注册表 shm，其余进程沿用 P0 的值。 | `1000000` | 1 – 268435456 |
 | `UBALLOC_HEARTBEAT_ENABLED` | 心跳功能总开关；设为 `0` 关闭心跳写入和死节点检测（peer 检测回退至 `kill(pid,0)` 检查） | `1` | `0`/`1` |
 | `UBALLOC_HEARTBEAT_INTERVAL_MS` | 心跳计数器递增间隔（毫秒）。每进程由独立后台线程按此间隔递增 bootstrap 槽位中的心跳计数器，供 peer 检测存活状态。必须小于 `UBALLOC_DEAD_PEER_TIMEOUT_MS`，否则自动调整为 2× 间隔。 | `5000` | 任意正整数 |
 | `UBALLOC_DEAD_PEER_TIMEOUT_MS` | peer 死亡判定阈值（毫秒）。peer 的心跳计数器停止推进超过此时间后，判定该 peer 已死亡，自动强制释放其借用段，`wait_for_unreferenced` 也在所有 peer 死亡后继续推进。必须大于 `UBALLOC_HEARTBEAT_INTERVAL_MS`。 | `30000` | 任意正整数 |
@@ -461,7 +462,7 @@ uballoc是专为aarch64架构、Linux操作系统下多进程多节点分布式�
 uballoc的API分为两类：
 
 - **基础API**：`init`、`malloc`、`malloc_published`、`free`、`realloc`、`lookup_by_type`、`lookup_by_type_blocking`、`shm_new`/`shm_delete`（含`pub_tid`合并发布重载）。绝大多数应用只需使用这一组API即可完成跨进程共享内存的分配、重分配、发布、发现与释放。
-- **可选/高级API**：`memalign`、`publish`、`unpublish`、`lookup_by_address`、`rank`、`total_processes`、`is_owner`、`is_initialized`、`reset`、`finalize`、`enable_fault_handler`/`disable_fault_handler`、`enable_userfaultfd`/`disable_userfaultfd`。这些API不是必须的——通常用于对齐分配、手动发布/取消发布、查询集群状态、fault handler回退或完全重置分配器等高级场景。其中`finalize`用于进程退出前显式清理，修复UBSE环境下的ret=20/1005问题（详见[uballoc_finalize](#uballoc_finalize)章节）。
+- **可选/高级API**：`memalign`、`publish`、`unpublish`、`unpublish_by_type`、`lookup_by_address`、`rank`、`total_processes`、`is_owner`、`is_initialized`、`reset`、`finalize`、`enable_fault_handler`/`disable_fault_handler`、`enable_userfaultfd`/`disable_userfaultfd`。这些API不是必须的——通常用于对齐分配、手动发布/取消发布、查询集群状态、fault handler回退或完全重置分配器等高级场景。其中`finalize`用于进程退出前显式清理，修复UBSE环境下的ret=20/1005问题（详见[uballoc_finalize](#uballoc_finalize)章节）。
 
 线程ID在首次使用时自动分配，无需显式调用`init_thread`。
 
@@ -1561,6 +1562,51 @@ C API：`uballoc_malloc_on(size, node_index, uballoc_node_fallback_t)`、`uballo
 ### 测试
 
 `tests/unit/test_malloc_on.cpp` —— POSIX 自动化子集 + 双节点 UBSE 手工用例（`UBALLOC_ROLE=P0|P1`）。
+
+---
+
+## 发布注册表（Published Registry）
+
+### 概述
+
+发布注册表维护 `type_id` → `(地址, 大小, 属主进程)` 的映射，用于跨进程发现。支持最多 `UBALLOC_MAX_TYPE_ID`（默认 1,000,000；客户要求的 10,000,000 已在真实集群上验证）个并发已发布条目。
+
+注册表是所有进程共享的直接索引数组，由 P0 创建、各进程映射。每条目 16 字节，即容量 × 16 字节的共享内存。由于 UBSE 守护进程拒绝创建超过约 160 MB 的 shm，大容量注册表会自动按最大 128 MiB 分块（`ub-{heap_id}-registry`、`ub-{heap_id}-registry-1`、…）并连续映射——API 与 O(1) 索引运算不受影响。发布采用三步原子协议（认领 → 写大小 → 激活）；查找为 O(1)——一次原子读。
+
+### API
+
+```cpp
+// O(1) —— 推荐的取消发布方式（热路径首选）
+bool uballoc::unpublish_by_type(uint32_t type_id);
+
+// O(n) —— 向后兼容的按地址取消发布（全表扫描）
+bool uballoc::unpublish(void* ptr);
+bool uballoc::unpublish(void* ptr, int owner_process);
+
+// O(n) —— 冷路径（全表扫描）
+uballoc::PublishedInfo uballoc::lookup_by_address(void* ptr);
+```
+
+C API：`uballoc_unpublish_by_type(type_id)`。
+
+### 语义
+
+- **容量**：通过 `UBALLOC_MAX_TYPE_ID` 配置（默认 1M；上限 268,435,456，受 4 GB 注册表 VA 预留约束）。P0 的值具有权威性；后加入进程沿用之（不一致时告警）。已在真实 UBSE 集群上验证 100k / 262144 / 1M / 10M。
+- **槽位可回收**：`unpublish` 立即释放槽位供同 type_id 复用（移除了旧版 256 条目"粘性槽位"行为）。
+- **`unpublish(void*)` 为 O(n)**：热路径请使用 O(1) 的 `unpublish_by_type(type_id)`。
+- **`lookup_by_address` 为 O(n)**：全表扫描。发现场景请使用 O(1) 的 `lookup_by_type`。
+- **内部指针**：`publish(ptr, size, type_id)` 接受任意指针与任意大小——大小按传入值原样存储，不从分配器元数据推导。支持大分配的子区域发布。
+- **崩溃清理**：当发布因 type_id 被已死亡 peer 占用而失败时（同节点 `kill` 检查），槽位被惰性回收后重试发布。
+
+### 相对 V1（256 条目注册表）的破坏性变更
+
+| V1（旧） | V2（新） |
+|---|---|
+| 最多 256 个 type_id | `UBALLOC_MAX_TYPE_ID`（默认 1M） |
+| 元数据 shm 内的每进程注册表 | 专用 shm 中的单一共享注册表（超过 128 MiB 自动分块） |
+| 粘性槽位（unpublish 不释放） | unpublish 即回收槽位 |
+| `unpublish(void*)` 为 O(256) | `unpublish(void*)` 为 O(n)——请改用 `unpublish_by_type` |
+| `lookup_by_address` 为 O(P×256) | `lookup_by_address` 为 O(n) |
 
 ---
 

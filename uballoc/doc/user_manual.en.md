@@ -348,6 +348,7 @@ As shown in [**Table 3** uballoc environment variables](#uballoc-environment-var
 | `UBALLOC_RECLAIM_SCAN_INTERVAL_MS` | ASYNC mode background thread scan interval (ms) | `5000` | any positive integer |
 | `UBALLOC_RECLAIM_STATS` | Memory statistics switch; set to 0 to disable hot-path byte counting (zero overhead) | `1` | `0`/`1` |
 | `UBALLOC_RECLAIM_LOG_STATS_INTERVAL` | ASYNC mode `[RECLAIM-STATS]` log interval (emit every N background scans) | `30` | any positive integer |
+| `UBALLOC_MAX_TYPE_ID` | Published registry capacity (number of type_id entries; 16 bytes each). P0 reads this at init and creates the registry shms with this capacity; other processes adopt P0's value. | `1000000` | 1 – 268435456 |
 | `UBALLOC_HEARTBEAT_ENABLED` | Heartbeat master switch; set to `0` to disable heartbeat writes and dead-peer detection (peer detection falls back to `kill(pid,0)` check). | `1` | `0`/`1` |
 | `UBALLOC_HEARTBEAT_INTERVAL_MS` | Heartbeat counter increment interval (ms). An independent background thread increments a heartbeat counter in the bootstrap slot at this interval for peer liveness detection. Must be less than `UBALLOC_DEAD_PEER_TIMEOUT_MS`, otherwise auto-adjusted to 2× interval. | `5000` | any positive integer |
 | `UBALLOC_DEAD_PEER_TIMEOUT_MS` | Peer death threshold (ms). When a peer's heartbeat counter stops advancing for longer than this, the peer is declared dead: its borrowed segments are force-released, and `wait_for_unreferenced` proceeds after all peers are dead. Must be greater than `UBALLOC_HEARTBEAT_INTERVAL_MS`. | `30000` | any positive integer |
@@ -461,7 +462,7 @@ uballoc is a C++17 shared-memory allocator designed for aarch64-architecture, mu
 The uballoc API falls into two categories:
 
 - **Basic API**: `init`, `malloc`, `malloc_published`, `free`, `realloc`, `lookup_by_type`, `lookup_by_type_blocking`, `shm_new`/`shm_delete` (including the `pub_tid` merged-publish overload). The vast majority of applications need only this set to allocate, reallocate, publish, discover, and free cross-process shared memory.
-- **Optional/advanced API**: `memalign`, `publish`, `unpublish`, `lookup_by_address`, `rank`, `total_processes`, `is_owner`, `is_initialized`, `reset`, `finalize`, `enable_fault_handler`/`disable_fault_handler`, `enable_userfaultfd`/`disable_userfaultfd`. These are not required — they are typically used for aligned allocation, manual publish/unpublish timing, cluster-state queries, fault-handler fallback, or full allocator reset. `finalize` is for explicit teardown before process exit, fixing ret=20/1005 in UBSE environments (see the [uballoc_finalize](#uballoc_finalize) section).
+- **Optional/advanced API**: `memalign`, `publish`, `unpublish`, `unpublish_by_type`, `lookup_by_address`, `rank`, `total_processes`, `is_owner`, `is_initialized`, `reset`, `finalize`, `enable_fault_handler`/`disable_fault_handler`, `enable_userfaultfd`/`disable_userfaultfd`. These are not required — they are typically used for aligned allocation, manual publish/unpublish timing, cluster-state queries, fault-handler fallback, or full allocator reset. `finalize` is for explicit teardown before process exit, fixing ret=20/1005 in UBSE environments (see the [uballoc_finalize](#uballoc_finalize) section).
 
 Thread IDs are assigned automatically on first use — no explicit `init_thread` call is needed.
 
@@ -1566,6 +1567,51 @@ Cache behavior is **location-based**: processes on the backing node access the m
 ### Tests
 
 `tests/unit/test_malloc_on.cpp` — automated POSIX subset plus a two-node UBSE manual recipe (`UBALLOC_ROLE=P0|P1`).
+
+---
+
+## Published Registry
+
+### Overview
+
+The published registry maps `type_id` → `(address, size, owner)` for cross-process discovery. It supports up to `UBALLOC_MAX_TYPE_ID` (default 1,000,000; the customer requirement of 10,000,000 is validated) concurrent published entries, with the full `uint32_t` type_id space available.
+
+The registry is a shared direct-indexed array created by P0 and mapped by all processes. Each entry is 16 bytes, so capacity × 16 bytes of shared memory is committed. Because the UBSE daemon rejects shm creates above ~160 MB, large registries are automatically split into chunks of at most 128 MiB (`ub-{heap_id}-registry`, `ub-{heap_id}-registry-1`, …) mapped contiguously — the API and the O(1) index arithmetic are unaffected. Publishing uses a 3-step atomic protocol (claim → write size → activate); lookup is O(1) — one atomic load.
+
+### API
+
+```cpp
+// O(1) — primary unpublish (recommended for hot paths)
+bool uballoc::unpublish_by_type(uint32_t type_id);
+
+// O(n) — backward-compatible wrapper (scans the registry)
+bool uballoc::unpublish(void* ptr);
+bool uballoc::unpublish(void* ptr, int owner_process);
+
+// O(n) — cold path (scans the registry)
+uballoc::PublishedInfo uballoc::lookup_by_address(void* ptr);
+```
+
+C API: `uballoc_unpublish_by_type(type_id)`.
+
+### Semantics
+
+- **Capacity**: configurable via `UBALLOC_MAX_TYPE_ID` (default 1M; hard ceiling 268,435,456 = the 4 GB registry VA reservation). P0's value is authoritative; late joiners adopt it (warning on mismatch). Validated on the real UBSE backend at 100k / 262144 / 1M / 10M.
+- **Slots are recycled**: `unpublish` frees the slot immediately for reuse by the same type_id. (The old 256-entry "sticky slot" behavior is removed.)
+- **`unpublish(void*)` is O(n)**: for hot paths, prefer `unpublish_by_type(type_id)` which is O(1).
+- **`lookup_by_address` is O(n)**: scans the entire registry. For discovery, prefer `lookup_by_type` which is O(1).
+- **Interior pointers**: `publish(ptr, size, type_id)` accepts any pointer and any size — the size is stored exactly as passed, not derived from allocator metadata. Sub-regions of larger allocations are supported.
+- **Crash cleanup**: if a publish fails because the type_id is claimed by a dead peer (same-node `kill` check), the slot is lazily reclaimed and the publish retried.
+
+### Breaking changes from V1 (256-entry registry)
+
+| V1 (old) | V2 (new) |
+|---|---|
+| 256 max type_ids | `UBALLOC_MAX_TYPE_ID` (default 1M) |
+| Per-process registries in metadata shm | Single shared registry in dedicated shm(s), auto-chunked at 128 MiB |
+| Sticky slots (unpublish doesn't free) | Slots recycled on unpublish |
+| `unpublish(void*)` is O(256) | `unpublish(void*)` is O(n) — use `unpublish_by_type` |
+| `lookup_by_address` is O(P×256) | `lookup_by_address` is O(n) |
 
 ---
 
