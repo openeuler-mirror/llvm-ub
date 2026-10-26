@@ -159,13 +159,21 @@ struct Huge {
 
     static constexpr size_t MAX_SLOTS = 1024;
 
+    // Slot value: bit0=used, bit1-24=slot_count (max 16M = 32TB at 2MB/slot,
+    // 16x headroom over MAX_HUGE_SLOTS like tid's 16x), bit32-47=tid.
+    // P2-2 fix: old 16-bit field (max 65535=128GB) truncated slot_count>=65536
+    // to 0, leaking allocations >=128GB via free_offset's slot_count==0 early return.
+    static constexpr uint64_t SLOT_COUNT_BITS = 24;
+    static constexpr uint64_t SLOT_COUNT_MASK = (1ULL << SLOT_COUNT_BITS) - 1;  // 0xFFFFFF
+    static constexpr uint64_t SLOT_COUNT_SHIFT = 1;  // skip bit 0 (used flag)
+
     static uint64_t make_slot_value(ThreadId id, size_t slot_count) {
         return (static_cast<uint64_t>(id.internal()) << 32) |
-               (static_cast<uint64_t>(slot_count) << 16) | 1;
+               (static_cast<uint64_t>(slot_count) << SLOT_COUNT_SHIFT) | 1;
     }
 
     static size_t get_slot_count(uint64_t val) {
-        return static_cast<size_t>((val >> 16) & 0xFFFF);
+        return static_cast<size_t>((val >> SLOT_COUNT_SHIFT) & SLOT_COUNT_MASK);
     }
 
     static ThreadId get_owner(uint64_t val) {
@@ -260,11 +268,29 @@ struct Huge {
         // optimization and trade-offs.
         size_t slot_count = (size + HugeSize::SLAB_SIZE - 1) / HugeSize::SLAB_SIZE;
 
+        // Geometric upper bound: reject slot_count > MAX_HUGE_SLOTS (524288 =
+        // 1TB). Without this, unsatisfiable requests loop try_grow until VA
+        // exhaustion (P2-1). The 24-bit field is the second line of defense.
+        if (slot_count > MAX_HUGE_SLOTS) {
+            LOG_WARN("allocate: slot_count " << slot_count
+                     << " exceeds MAX_HUGE_SLOTS " << MAX_HUGE_SLOTS
+                     << " (size " << (size >> 30) << "GB > 1TB cap)");
+            return nullptr;
+        }
+
         void* p = scan_and_claim(shared, region_base, id, size, slot_count, out);
         if (p) return p;
 
+        // Loop try_grow: single allocation may need multiple segments (512MB
+        // = 4 segs, 2GB = 16 segs); each grow adds 1.
+        // Geometric bound: stop when active reaches MAX_HUGE_SLOTS — prevents
+        // unsatisfiable requests (fragmentation) from looping to VA exhaustion.
+        // Sticky OOM: growing_==2 (grow_segment failure = real OOM) is permanent
+        // until init/soft_reset; free_offset reclaims slots but doesn't reset
+        // growing_. Design favors stability over auto-recovery.
         GrowFn fn = grow_fn_huge().load(std::memory_order_acquire);
-        if (fn && shared->try_grow(fn)) {
+        while (fn && active_slot_count(shared) < MAX_HUGE_SLOTS
+               && shared->try_grow(fn)) {
             p = scan_and_claim(shared, region_base, id, size, slot_count, out);
             if (p) return p;
         }

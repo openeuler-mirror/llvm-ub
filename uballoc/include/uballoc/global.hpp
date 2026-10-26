@@ -1640,6 +1640,25 @@ public:
         if (!tl_allocator_ptr_) {
             uint16_t tid = tl_thread_id_;
             tl_allocator_ptr_ = new Allocator<void, void>;
+            Huge huge_obj(huge_shared_ptrs_[rank_], huge_data_,
+                         data_huge_base_,
+                         ThreadId(tid),
+                         huge_shared_ptrs_.data(),
+                         data_huge_base_ptrs_.data(),
+                         total_processes_, rank_);
+            // Enable dynamic slots layout: point to the 4MB slots array
+            // reserved in metadata (MAX_HUGE_SLOTS = 524288 = 1TB cap).
+            // Previously shared_layout was never set, so get_slots() used
+            // HugeShared::slots[1024] (fixed, 2GB cap).
+            {
+                auto dyn_sl = compute_distributed_shared_region_layout<
+                    typename BackendT::AllocatorShared>(
+                    0, static_cast<int>(MAX_PROCESSES), 0, 0, 0);
+                huge_obj.shared_layout.slots_count = MAX_HUGE_SLOTS;
+                huge_obj.shared_layout.slots_offset =
+                    dyn_sl.huge_slots_offset - dyn_sl.huge_shared_offset;
+                huge_obj.shared_layout.hint_offset = offsetof(HugeShared, hint);
+            }
             tl_allocator_ptr_->init_distributed(
                 static_cast<DistributedAllocatorShared*>(distributed_shared_ptrs_[rank_]),
                 distributed_owned_arrays_[rank_],
@@ -1647,12 +1666,7 @@ public:
                             &small_slab_, &small_data_),
                 Heap<Large>(large_shared_ptrs_[rank_], &large_owned_[tid],
                             &large_slab_, &large_data_),
-                Huge(huge_shared_ptrs_[rank_], huge_data_,
-                     data_huge_base_,
-                     ThreadId(tid),
-                     huge_shared_ptrs_.data(),
-                     data_huge_base_ptrs_.data(),
-                     total_processes_, rank_),
+                std::move(huge_obj),
                 rank_, total_processes_, num_cores_);
 
             tl_allocator_ptr_->focus(ThreadId(tid));

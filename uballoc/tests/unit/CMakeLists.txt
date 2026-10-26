@@ -26,7 +26,8 @@ set(UBALLOC_UNIT_TEST_TARGETS
     test_ar13_userfaultfd
     test_ar14_ubse_provider
     test_ar15_cleanup
-    test_malloc_on)
+    test_malloc_on
+    test_grow_2gb)
 
 foreach(_target ${UBALLOC_UNIT_TEST_TARGETS})
     add_executable(${_target} ${_target}.cpp)
