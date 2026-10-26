@@ -74,11 +74,18 @@ private:
     std::array<char*, MAX_PROCESSES> data_huge_base_ptrs_;
 
     // Million-type-id published registry (million_type_id_registry.md).
-    // Single shared direct-indexed array in a dedicated shm.
+    // Single shared direct-indexed array, split into at most
+    // REGISTRY_MAX_CHUNKS shims (the UBSE daemon caps shm size at
+    // ~160 MB) mapped contiguously in the reserved registry VA.
+    struct RegistryChunk {
+        void* mapping = nullptr;
+        size_t bytes = 0;  // mapped (rounded) size
+        typename BackendT::ShmHandle handle = BackendT::INVALID_HANDLE;
+    };
     PublishedEntryV2* registry_entries_ = nullptr;
     uint64_t registry_max_type_id_ = 0;
-    void* registry_mapping_ = nullptr;  // mmap result for cleanup
-    typename BackendT::ShmHandle registry_handle_ = BackendT::INVALID_HANDLE;
+    uint32_t registry_chunk_count_ = 0;
+    RegistryChunk registry_chunks_[REGISTRY_MAX_CHUNKS];
 
     std::unique_ptr<ReclaimThread> reclaim_thread_;
     pid_t reclaim_creator_pid_ = 0;
@@ -1784,47 +1791,76 @@ public:
         }
         registry_max_type_id_ = cap;
 
-        std::string name = backend_.registry_shm_name();
+        // Split into chunks: the daemon caps shm size at ~160 MB
+        // (UBS_ENGINE_ERR_OUT_OF_RANGE above that), so a 10M-entry
+        // registry (160 MB) needs 2 x 128 MiB chunks. Chunks are mapped
+        // contiguously at REGISTRY_OFFSET so the flat direct-index
+        // arithmetic in publish/lookup is unchanged.
+        const size_t entry_bytes =
+            static_cast<size_t>(cap) * sizeof(PublishedEntryV2);
+        registry_chunk_count_ = static_cast<uint32_t>(
+            (entry_bytes + REGISTRY_CHUNK_BYTES - 1) / REGISTRY_CHUNK_BYTES);
+        if (registry_chunk_count_ == 0) registry_chunk_count_ = 1;
+        if (registry_chunk_count_ > REGISTRY_MAX_CHUNKS) {
+            LOG_ERROR("init_published_registry: capacity " << cap
+                      << " exceeds VA reservation (max chunks "
+                      << REGISTRY_MAX_CHUNKS << ")");
+            registry_chunk_count_ = 0;
+            return;
+        }
         uintptr_t registry_va = backend_.va_base_ + REGISTRY_OFFSET;
-        size_t shm_size = cap * sizeof(PublishedEntryV2);
-        size_t effective_size = ((shm_size + 0xFFFFFULL) & ~0xFFFFFULL);
 
         if (rank_ == 0) {
-            auto res = backend_.shm_try_create_registry(name, effective_size);
-            if (is_err(res)) {
-                auto err = unwrap_err(res);
-                if (err.kind == ErrorKind::ShmExists) {
-                    LOG_WARN("init_published_registry: stale shm, attaching");
-                    res = backend_.shm_attach_registry(name);
+            for (uint32_t c = 0; c < registry_chunk_count_; ++c) {
+                size_t chunk_bytes = std::min(
+                    REGISTRY_CHUNK_BYTES,
+                    entry_bytes - static_cast<size_t>(c) * REGISTRY_CHUNK_BYTES);
+                // Round to 2 MiB (the UBSE shm granularity; POSIX is
+                // unaffected — the file is simply created this size).
+                size_t eff = (chunk_bytes + 0x1FFFFFULL) & ~0x1FFFFFULL;
+                std::string name = backend_.registry_shm_name(c);
+                auto res = backend_.shm_try_create_registry(name, eff);
+                if (is_err(res)) {
+                    auto err = unwrap_err(res);
+                    if (err.kind == ErrorKind::ShmExists) {
+                        LOG_WARN("init_published_registry: stale shm, attaching");
+                        res = backend_.shm_attach_registry(name);
+                    }
                     if (is_err(res)) {
-                        LOG_ERROR("init_published_registry: attach failed");
+                        LOG_ERROR("init_published_registry: chunk " << c
+                                  << " create/attach failed");
+                        cleanup_published_registry();
                         return;
                     }
-                } else {
-                    LOG_ERROR("init_published_registry: create failed");
+                }
+                auto& ch = registry_chunks_[c];
+                ch.handle = unwrap(res);
+                ch.bytes = eff;
+                void* mapped = ::mmap(
+                    reinterpret_cast<void*>(
+                        registry_va + static_cast<uintptr_t>(c) * REGISTRY_CHUNK_BYTES),
+                    eff, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED,  // over our own PROT_NONE reservation
+                    backend_.registry_handle_fd(ch.handle), 0);
+                if (mapped == MAP_FAILED) {
+                    LOG_ERROR("init_published_registry: mmap chunk " << c
+                              << " failed errno=" << errno);
+                    backend_.registry_close(ch.handle);
+                    ch.handle = BackendT::INVALID_HANDLE;
+                    ch.bytes = 0;
+                    cleanup_published_registry();
                     return;
                 }
+                ch.mapping = mapped;
+                // Zero on every P0 init (fresh start = clean registry).
+                std::memset(mapped, 0, eff);
             }
-            registry_handle_ = unwrap(res);
-
-            void* mapped = ::mmap(reinterpret_cast<void*>(registry_va),
-                                  effective_size,
-                                  PROT_READ | PROT_WRITE, MAP_SHARED,
-                                  backend_.registry_handle_fd(registry_handle_), 0);
-            if (mapped == MAP_FAILED) {
-                LOG_ERROR("init_published_registry: mmap failed errno=" << errno);
-                backend_.registry_close(registry_handle_);
-                registry_handle_ = BackendT::INVALID_HANDLE;
-                return;
-            }
-            registry_mapping_ = mapped;
-            // Zero the registry on every P0 init (matches the old per-process
-            // registry behavior: fresh start = clean registry). Entry
-            // persistence across process restarts is a future optimization.
-            std::memset(mapped, 0, effective_size);
-            registry_entries_ = reinterpret_cast<PublishedEntryV2*>(mapped);
-            backend_.bootstrap_block_->registry_ready.store(1, std::memory_order_release);
-            LOG_INFO("init_published_registry: P0 created, capacity=" << cap);
+            registry_entries_ = reinterpret_cast<PublishedEntryV2*>(
+                registry_chunks_[0].mapping);
+            backend_.bootstrap_block_->registry_ready.store(
+                1, std::memory_order_release);
+            LOG_INFO("init_published_registry: P0 created, capacity=" << cap
+                     << " chunks=" << registry_chunk_count_);
         } else {
             for (int i = 0; i < 30000; ++i) {
                 if (backend_.bootstrap_block_->registry_ready.load(
@@ -1837,42 +1873,62 @@ public:
                 return;
             }
 
-            auto res = backend_.shm_attach_registry(name);
-            if (is_err(res)) {
-                LOG_ERROR("init_published_registry: attach failed");
-                return;
+            for (uint32_t c = 0; c < registry_chunk_count_; ++c) {
+                size_t chunk_bytes = std::min(
+                    REGISTRY_CHUNK_BYTES,
+                    entry_bytes - static_cast<size_t>(c) * REGISTRY_CHUNK_BYTES);
+                size_t eff = (chunk_bytes + 0x1FFFFFULL) & ~0x1FFFFFULL;
+                std::string name = backend_.registry_shm_name(c);
+                auto res = backend_.shm_attach_registry(name);
+                if (is_err(res)) {
+                    LOG_ERROR("init_published_registry: rank " << rank_
+                              << " attach chunk " << c << " failed");
+                    cleanup_published_registry();
+                    return;
+                }
+                auto& ch = registry_chunks_[c];
+                ch.handle = unwrap(res);
+                ch.bytes = eff;
+                void* mapped = ::mmap(
+                    reinterpret_cast<void*>(
+                        registry_va + static_cast<uintptr_t>(c) * REGISTRY_CHUNK_BYTES),
+                    eff, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED,
+                    backend_.registry_handle_fd(ch.handle), 0);
+                if (mapped == MAP_FAILED) {
+                    LOG_ERROR("init_published_registry: mmap chunk " << c
+                              << " failed errno=" << errno);
+                    backend_.registry_close(ch.handle);
+                    ch.handle = BackendT::INVALID_HANDLE;
+                    ch.bytes = 0;
+                    cleanup_published_registry();
+                    return;
+                }
+                ch.mapping = mapped;
             }
-            registry_handle_ = unwrap(res);
-
-            void* mapped = ::mmap(reinterpret_cast<void*>(registry_va),
-                                  effective_size,
-                                  PROT_READ | PROT_WRITE, MAP_SHARED,
-                                  backend_.registry_handle_fd(registry_handle_), 0);
-            if (mapped == MAP_FAILED) {
-                LOG_ERROR("init_published_registry: mmap failed errno=" << errno);
-                backend_.registry_close(registry_handle_);
-                registry_handle_ = BackendT::INVALID_HANDLE;
-                return;
-            }
-            registry_mapping_ = mapped;
-            registry_entries_ = reinterpret_cast<PublishedEntryV2*>(mapped);
-            LOG_INFO("init_published_registry: rank " << rank_ << " attached");
+            registry_entries_ = reinterpret_cast<PublishedEntryV2*>(
+                registry_chunks_[0].mapping);
+            LOG_INFO("init_published_registry: rank " << rank_
+                     << " attached " << registry_chunk_count_ << " chunk(s)");
         }
     }
 
     void cleanup_published_registry() {
-        if (registry_mapping_) {
-            size_t effective_size = ((registry_max_type_id_ * sizeof(PublishedEntryV2)
-                                      + 0xFFFFFULL) & ~0xFFFFFULL);
-            ::munmap(registry_mapping_, effective_size);
-            registry_mapping_ = nullptr;
-        }
-        if (registry_handle_ != BackendT::INVALID_HANDLE) {
-            backend_.registry_close(registry_handle_);
-            registry_handle_ = BackendT::INVALID_HANDLE;
+        for (uint32_t c = 0; c < REGISTRY_MAX_CHUNKS; ++c) {
+            auto& ch = registry_chunks_[c];
+            if (ch.mapping) {
+                ::munmap(ch.mapping, ch.bytes);
+                ch.mapping = nullptr;
+            }
+            if (ch.handle != BackendT::INVALID_HANDLE) {
+                backend_.registry_close(ch.handle);
+                ch.handle = BackendT::INVALID_HANDLE;
+            }
+            ch.bytes = 0;
         }
         registry_entries_ = nullptr;
         registry_max_type_id_ = 0;
+        registry_chunk_count_ = 0;
     }
 
     int publish(void* ptr, size_t size, uint32_t type_id) {

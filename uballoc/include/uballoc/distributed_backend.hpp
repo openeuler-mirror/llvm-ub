@@ -2119,8 +2119,11 @@ public:
     }
 
     // Published registry shm helpers (million_type_id_registry.md §2.3).
-    std::string registry_shm_name() const {
-        return ShmProviderT::shm_registry_name(heap_id_);
+    // Chunk 0 keeps the legacy single-shm name; chunks 1..N (large
+    // registries split at the daemon's ~160 MB shm cap) get a -N suffix.
+    std::string registry_shm_name(size_t chunk = 0) const {
+        auto base = ShmProviderT::shm_registry_name(heap_id_);
+        return chunk == 0 ? base : base + "-" + std::to_string(chunk);
     }
 
     Result<ShmHandle> shm_try_create_registry(const std::string& name, size_t size) {

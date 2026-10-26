@@ -37,6 +37,18 @@ constexpr uint32_t TID_C = 202;
 constexpr uint32_t TID_TO = 150;   // DT09-6 blocking target
 constexpr uint32_t TID_TO_MISS = 151;
 
+// Effective registry capacity: same parsing as the library (P0 side).
+// The suite runs at the default 1M; UBALLOC_MAX_TYPE_ID scales it (the
+// customer requirement is up to 10M — see million_type_id_registry.md).
+uint64_t ar_registry_capacity() {
+    const char* env = std::getenv("UBALLOC_MAX_TYPE_ID");
+    if (env) {
+        long v = std::atol(env);
+        if (v > 0) return static_cast<uint64_t>(v);
+    }
+    return 1'000'000;
+}
+
 // -----------------------------------------------------------------------------
 // DT09-1 R1,R2
 // -----------------------------------------------------------------------------
@@ -255,8 +267,10 @@ void dt09_5_registry_exhaustion(const std::string& heap_id) {
         {
             void* q = uballoc::malloc(32);
             assert(q);
-            // 1M default capacity — type_id 1M is out of range.
-            assert(uballoc::publish(q, 32, 1000000) == -1);
+            // Capacity comes from UBALLOC_MAX_TYPE_ID (default 1M) —
+            // type_id == capacity is out of range.
+            assert(uballoc::publish(q, 32,
+                     static_cast<uint32_t>(ar_registry_capacity())) == -1);
             uballoc::free(q);
         }
 
@@ -336,6 +350,91 @@ void dt09_6_blocking_timeout(const std::string& heap_id) {
 // -----------------------------------------------------------------------------
 // DT09-7 R4: lookup_by_address scans without triggering remote load
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// DT09-9 capacity boundaries (default 1M; scales with UBALLOC_MAX_TYPE_ID —
+// the customer requirement is up to 10M, i.e. a 160 MB registry)
+// -----------------------------------------------------------------------------
+void dt09_9_capacity_boundaries(const std::string& heap_id) {
+    const uint64_t cap = ar_registry_capacity();
+    const uint32_t last = static_cast<uint32_t>(cap - 1);
+    std::cout << "[DT09-9] capacity=" << cap / 1000 << "k: boundary + scattered ids..."
+              << std::endl;
+    int fds[2];
+    assert(pipe(fds) == 0);
+
+    ar_set_heap_id(heap_id);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        ::close(fds[1]);
+        uint64_t v = 0;
+        ar_read_fd(fds[0], &v, sizeof(v));
+
+        // Cross-process visibility at the top boundary id.
+        ar_child_init();
+        auto info = uballoc::lookup_by_type(last);
+        assert(info.address == reinterpret_cast<void*>(v));
+        assert(info.size == 64);
+        auto* bytes = static_cast<const uint8_t*>(info.address);
+        for (int i = 0; i < 64; ++i) assert(bytes[i] == 0xC3);
+        _exit(0);
+    }
+
+    ::close(fds[0]);
+    ar_parent_init();
+
+    // Scattered + boundary ids, incl. both edges of the id space.
+    const std::vector<uint32_t> ids = {0, 1, 63, 64, 4095, 65535,
+                                       static_cast<uint32_t>(cap / 2), last};
+    std::vector<void*> ptrs;
+    for (uint32_t tid : ids) {
+        void* p = uballoc::malloc(64);
+        assert(p);
+        assert(uballoc::publish(p, 64, tid) >= 0);
+        std::memset(p, 0xC3, 64);
+        ptrs.push_back(p);
+    }
+    // Every published id resolves to exactly its pointer.
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto info = uballoc::lookup_by_type(ids[i]);
+        assert(info.address == ptrs[i]);
+        assert(info.size == 64);
+        assert(info.owner_process == 0);
+    }
+    // type_id == capacity is rejected; its lookup misses.
+    {
+        void* q = uballoc::malloc(64);
+        assert(q);
+        assert(uballoc::publish(q, 64, static_cast<uint32_t>(cap)) == -1);
+        assert(!uballoc::lookup_by_type(static_cast<uint32_t>(cap)).address);
+        uballoc::free(q);
+    }
+
+    // Hand the boundary pointer to the child, then reap it.
+    uint64_t v = reinterpret_cast<uintptr_t>(ptrs.back());
+    ar_write_fd(fds[1], &v, sizeof(v));
+    int st;
+    waitpid(pid, &st, 0);
+    check_child(st);
+    ::close(fds[1]);
+
+    // unpublish_by_type at the top boundary; then by-address — the
+    // documented O(capacity) scan (160 MB at 10M).
+    assert(uballoc::unpublish_by_type(last));
+    assert(!uballoc::lookup_by_type(last).address);
+    auto t0 = std::chrono::steady_clock::now();
+    assert(uballoc::unpublish(ptrs[6]));  // mid-table: exercises half the scan
+    auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0).count();
+    std::cout << "  OK (unpublish-by-address scan over " << cap
+              << " entries: " << scan_ms << " ms)" << std::endl;
+
+    for (size_t i = 1; i < ids.size(); ++i)
+        if (i != 6) uballoc::unpublish_by_type(ids[i]);
+    for (void* p : ptrs) uballoc::free(p);
+    ar_alloc().reset();
+}
+
 void dt09_7_lookup_by_address(const std::string& heap_id) {
     std::cout << "[DT09-7] lookup_by_address: scan-only (P2 registry unmapped)..." << std::endl;
 
@@ -493,7 +592,9 @@ int main() {
     ar_pre_case_cleanup(id);
     dt09_8_non_owner_unpublish(id);
     ar_pre_case_cleanup(id);
-    dt09_5_registry_exhaustion(id);  // LAST: sticky exhaustion pollutes publishing
+    dt09_9_capacity_boundaries(id);
+    ar_pre_case_cleanup(id);
+        dt09_5_registry_exhaustion(id);  // LAST: sticky exhaustion pollutes publishing
 
     cleanup_all_distributed_shms(8, id);
     std::cout << "\n=== AR-09 DT passed ===" << std::endl;

@@ -50,6 +50,19 @@ constexpr uint32_t DEFAULT_MAX_TYPE_ID = 1'000'000;
 // the user might configure). 4 GB accommodates 256M entries.
 constexpr size_t REGISTRY_VA_SIZE = 4ULL << 30;  // 4 GB
 
+// Per-chunk shm cap. The UBSE daemon rejects shm creates above ~160 MB
+// with UBS_ENGINE_ERR_OUT_OF_RANGE (measured on UBEngine 1.1.10.0.b152:
+// 152 MiB accepted, 160,000,000 rejected), so large registries are split
+// into chunks of at most 128 MiB, mapped contiguously inside the reserved
+// registry VA. The direct-index arithmetic is unaffected: chunk c covers
+// ids [c*REGISTRY_CHUNK_ENTRIES, (c+1)*REGISTRY_CHUNK_ENTRIES) and sits
+// at REGISTRY_OFFSET + c*REGISTRY_CHUNK_BYTES.
+constexpr size_t REGISTRY_CHUNK_BYTES = 128ULL << 20;             // 128 MiB
+constexpr size_t REGISTRY_CHUNK_ENTRIES =
+    REGISTRY_CHUNK_BYTES / sizeof(PublishedEntryV2);              // 8M ids
+constexpr uint32_t REGISTRY_MAX_CHUNKS =
+    static_cast<uint32_t>(REGISTRY_VA_SIZE / REGISTRY_CHUNK_BYTES);  // 32
+
 // Return type of lookup_by_type / lookup_by_address (unchanged from V1).
 struct PublishedInfo {
     void* address = nullptr;
