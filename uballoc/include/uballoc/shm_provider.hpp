@@ -5,10 +5,12 @@
 #include <string>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <dirent.h>
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
@@ -345,6 +347,37 @@ struct PosixShmProvider {
 
     static std::string shm_registry_name(const std::string& heap_id) {
         return "/" + heap_id + "-registry";
+    }
+
+    // Prefix shared by every shm of a heap ("/<heap>-"). Used by the
+    // listing-based cleanup so it enumerates the actual live set instead
+    // of guessing a rank x class x slab grid (which cannot reach slabs
+    // beyond the hardcoded bound and misses heap-level shms).
+    static std::string heap_shm_prefix(const std::string& heap_id) {
+        return "/" + heap_id + "-";
+    }
+
+    // Live shm names with the given prefix, in shm_name() convention
+    // (leading "/"). POSIX shm objects are files under /dev/shm.
+    static std::vector<std::string> shm_list_with_prefix(const std::string& prefix) {
+        std::vector<std::string> out;
+        std::string p = prefix;
+        if (!p.empty() && p[0] == '/') p.erase(0, 1);
+        DIR* dir = ::opendir("/dev/shm");
+        if (!dir) {
+            LOG_WARN("shm_list_with_prefix: opendir /dev/shm failed: "
+                     << strerror(errno));
+            return out;
+        }
+        struct dirent* e;
+        while ((e = ::readdir(dir)) != nullptr) {
+            if (e->d_type == DT_REG || e->d_type == DT_UNKNOWN) {
+                if (::strncmp(e->d_name, p.c_str(), p.size()) == 0)
+                    out.emplace_back("/" + std::string(e->d_name));
+            }
+        }
+        ::closedir(dir);
+        return out;
     }
 
     static Result<ShmHandle> shm_create(const std::string& name, size_t size) {

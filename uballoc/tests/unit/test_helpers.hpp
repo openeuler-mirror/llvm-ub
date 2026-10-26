@@ -21,19 +21,25 @@ using ArBackend = uballoc::DistributedShmBackend<>;
 // Uses the backend's ShmProvider for proper naming conventions.
 // On UBSE, shm names use "ub-" prefix; on POSIX, they use "/" prefix.
 // This function handles both transparently.
+//
+// Enumerates the heap's actual live shms via a prefix listing and unlinks
+// exactly those. The previous blind grid (max_procs x 4 classes x 8 slabs)
+// issued hundreds of daemon RPCs per heap for names that never existed —
+// thousands per suite run — could not reach slabs beyond s7, and missed
+// heap-level shms (registry). max_procs is kept for signature
+// compatibility only.
 static void cleanup_all_distributed_shms(int max_procs, const std::string& heap_id = "heap") {
     using ShmProvider = uballoc::DistributedShmBackend<>::ShmProvider;
+    (void)max_procs;
     // Register no-op log callback before any UBSE calls to silence
     // verbose UBSE runtime logs during cleanup.
     ShmProvider::provider_init();
     ShmProvider::shm_unlink(ShmProvider::bootstrap_shm_name(heap_id));
-    for (int pid = 0; pid < max_procs; ++pid) {
-        for (int r = 0; r < 4; ++r) {
-            for (int seg = 0; seg < 8; ++seg) {
-                ShmProvider::shm_unlink(
-                    ShmProvider::shm_name(heap_id, pid, r, seg));
-            }
-        }
+    ShmProvider::shm_unlink(ShmProvider::shm_registry_name(heap_id));
+    const auto names =
+        ShmProvider::shm_list_with_prefix(ShmProvider::heap_shm_prefix(heap_id));
+    for (const auto& n : names) {
+        ShmProvider::shm_unlink(n);
     }
 }
 

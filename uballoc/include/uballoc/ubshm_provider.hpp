@@ -131,6 +131,15 @@ struct UBShmProvider {
         return "ub-" + heap_id + "-registry";
     }
 
+    // Prefix shared by every shm of a heap ("ub-<heap>-"). Used by the
+    // listing-based test cleanup to enumerate the actual live set instead
+    // of probing a rank x class x slab grid: the grid issues thousands of
+    // daemon RPCs for names that never existed, cannot reach slabs beyond
+    // its hardcoded bound, and misses heap-level shms (bootstrap/registry).
+    static std::string heap_shm_prefix(const std::string& heap_id) {
+        return "ub-" + heap_id + "-";
+    }
+
     static Result<ShmHandle> shm_create(const std::string&name, size_t size) {
         uint8_t usr_info[UBS_MEM_MAX_USR_INFO_LEN] = {0};
 

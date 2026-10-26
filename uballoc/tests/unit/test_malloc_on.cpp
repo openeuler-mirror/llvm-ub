@@ -262,13 +262,24 @@ extern "C" void mon8_c_api(const std::string& heap) {
 //   Node B: UBALLOC_ROLE=P1 ./test_malloc_on
 // Any start order; P0 polls for node 1 liveness, P1 polls for the publish.
 // ---------------------------------------------------------------------------
-constexpr const char* kUbseHeap = "mon-ubse";
+// Heap names are env-overridable so repeated runs on a shared cluster can
+// use fresh names instead of colliding with leftovers of a crashed run
+// (stuck shims cannot be deleted and make the bootstrap join go wrong).
+static const char* ubse_heap_name() {
+    const char* env = ::getenv("UBALLOC_UBSE_HEAP");
+    return (env && *env) ? env : "mon-ubse";
+}
+static const char* ubse_ack_name() {
+    const char* env = ::getenv("UBALLOC_UBSE_ACK");
+    return (env && *env) ? env : "mon-ack";
+}
+
 constexpr uint32_t kRemoteNode = 1;
 constexpr int kPollSecs = 120;
 
 static bool wait_ack_marker() {
     using P = uballoc::UBShmProvider;
-    const std::string n = P::shm_name("mon-ack", 1, 1);  // distinct heap — no collision
+    const std::string n = P::shm_name(ubse_ack_name(), 1, 1);  // distinct heap — no collision
     for (int i = 0; i < kPollSecs; ++i) {
         if (P::shm_exists(n)) return true;
         ::sleep(1);
@@ -278,16 +289,33 @@ static bool wait_ack_marker() {
 
 void ubse_p0_remote_growth() {
     std::cout << "[UBSE-P0] node-targeted growth on node " << kRemoteNode << "..." << std::endl;
-    ar_set_heap_id(kUbseHeap);
+    // Clean this heap's leftovers before joining (P0 only — P1 must not
+    // delete the segments P0 is about to create). With the listing-based
+    // cleanup this costs one prefix query plus the real names, instead
+    // of the old blind rank x class x slab grid.
+    cleanup_all_distributed_shms(2, ubse_heap_name());
+    ar_set_heap_id(ubse_heap_name());
     ar_parent_init();
     assert(uballoc::node_index_local() == 0);
 
-    // Wait until node 1 has a live rank (P1), then grow on it.
-    void* p = nullptr;
-    for (int i = 0; i < kPollSecs && !p; ++i) {
-        p = uballoc::malloc_on(64, kRemoteNode, uballoc::NodeFallback::Fail);
-        if (!p) ::sleep(1);
+    // Wedge-diagnosis sequencing. node_slot_id_of() reads the shared
+    // bootstrap slots — a liveness probe with NO daemon RPC and NO create.
+    // The previous protocol polled via malloc_on(), which issues a real
+    // remote-provisioned create the instant the peer's rank appears — i.e.
+    // while the peer process is still mid-init (its rank is claimed before
+    // the registry attach). All three dual-node runs so far wedged the peer
+    // node at exactly that point (registry imports never reached 2). Wait
+    // for liveness, then give the peer a grace window to finish its init
+    // (metadata segment + registry attach) before the first create.
+    for (int i = 0; i < kPollSecs; ++i) {
+        if (ar_alloc().backend().node_slot_id_of(kRemoteNode) != 0) break;
+        ::sleep(1);
     }
+    std::cout << "  node 1 live; 20s grace for P1 init..." << std::endl;
+    ::sleep(20);
+
+    // Single remote-provisioned growth attempt after the grace window.
+    void* p = uballoc::malloc_on(64, kRemoteNode, uballoc::NodeFallback::Fail);
     assert(p && "malloc_on(node 1, Fail) must succeed once P1 is live");
 
     uint32_t backing = uballoc::node_index_of(p);
@@ -313,7 +341,7 @@ void ubse_p0_remote_growth() {
 
 void ubse_p1_worker() {
     std::cout << "[UBSE-P1] worker (node 1)..." << std::endl;
-    ar_set_heap_id(kUbseHeap);
+    ar_set_heap_id(ubse_heap_name());
     ar_parent_init();
     assert(uballoc::node_index_local() == kRemoteNode);
 
@@ -343,7 +371,7 @@ void ubse_p1_worker() {
     // with this rank's real data segments).
     {
         using P = uballoc::UBShmProvider;
-        const std::string n = P::shm_name("mon-ack", 1, 1);
+        const std::string n = P::shm_name(ubse_ack_name(), 1, 1);
         P::shm_unlink(n);
         auto c = P::shm_try_create(n, P::min_shm_size);
         assert(uballoc::is_ok(c));
