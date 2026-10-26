@@ -81,6 +81,10 @@ static void cleanup_grow2g_shms(const std::string& heap_id) {
     using ShmProvider = Backend::ShmProvider;
     ShmProvider::provider_init();
     ShmProvider::shm_unlink(ShmProvider::bootstrap_shm_name(heap_id));
+    // remote-allocation only: the heap-level published registry is not
+    // deleted by reset() (heap-lifetime state); master's version of this
+    // test predates the registry feature.
+    ShmProvider::shm_unlink(ShmProvider::shm_registry_name(heap_id));
     constexpr int SEG_CAP = 32;
     for (int pid = 0; pid < static_cast<int>(uballoc::MAX_PROCESSES); ++pid) {
         for (int r = 0; r < 4; ++r) {
