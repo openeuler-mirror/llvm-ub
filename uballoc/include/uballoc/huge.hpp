@@ -99,6 +99,26 @@ struct HugeShared {
             return growing_.load(std::memory_order_acquire) == 0;
         }
     }
+
+    // Node-aware growth (malloc_on v1.1). Same protocol as HeapShared's
+    // try_grow_node: the target node rides the invocation, a race loser
+    // returns false (the winner may have grown a different node's or a
+    // local segment), and failure NEVER latches growing_=2 — node-targeted
+    // failures are per-request (unroutable node, provider quota/down) and
+    // must not poison plain huge growth for the rank.
+    bool try_grow_node(NodeGrowFn fn, uint32_t node) {
+        uint32_t state = growing_.load(std::memory_order_acquire);
+        if (state == 2) return false;
+
+        uint32_t expected = 0;
+        if (growing_.compare_exchange_strong(expected, 1,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            bool success = fn && fn(node);
+            growing_.store(0u, std::memory_order_release);
+            return success;
+        }
+        return false;  // lost the race — do not assume our node grew
+    }
 };
 
 struct HugeCheckedResult {
@@ -203,14 +223,25 @@ struct Huge {
         return std::min(max_slots, seg_active);
     }
 
+    // node_filter == UINT32_MAX: any backing (plain malloc path).
+    // Otherwise every segment the run spans must be backed by node_filter
+    // (malloc_on v1.1). On mismatch the scan skips past the first
+    // mismatching segment's end — no run overlapping it can qualify.
     void* scan_and_claim(HugeShared* sh, char* base,
                          ThreadId id, size_t size, size_t slot_count,
-                         HugeDescriptor& out) {
+                         HugeDescriptor& out,
+                         uint32_t node_filter = UINT32_MAX) {
         std::atomic<uint64_t>* slots = get_slots(sh);
         std::atomic<uint64_t>* hint = get_hint(sh);
         size_t active = active_slot_count(sh);
 
         if (active == 0 || slot_count > active) return nullptr;
+
+        HugeSlotBackingFn backing_fn = nullptr;
+        if (node_filter != UINT32_MAX) {
+            backing_fn = huge_slot_backing_node_fn().load(std::memory_order_acquire);
+            if (!backing_fn) return nullptr;  // cannot verify — do not claim
+        }
 
         size_t start_hint = hint->load(std::memory_order_acquire);
         if (start_hint >= active) start_hint = 0;
@@ -237,6 +268,24 @@ struct Huge {
                     continue;
                 }
 
+                if (backing_fn) {
+                    size_t first_seg = i / HUGE_SLOTS_PER_SEGMENT;
+                    size_t last_seg = (i + slot_count - 1) / HUGE_SLOTS_PER_SEGMENT;
+                    bool node_ok = true;
+                    for (size_t sg = first_seg; sg <= last_seg; ++sg) {
+                        if (backing_fn(sg) != node_filter) {
+                            node_ok = false;
+                            // Skip past the whole mismatching segment.
+                            next_i = (sg + 1) * HUGE_SLOTS_PER_SEGMENT;
+                            break;
+                        }
+                    }
+                    if (!node_ok) {
+                        i = next_i;
+                        continue;
+                    }
+                }
+
                 uint64_t desired = make_slot_value(id, slot_count);
                 uint64_t expected = 0;
                 if (slots[i].compare_exchange_strong(expected, desired,
@@ -258,6 +307,38 @@ struct Huge {
             }
         }
 
+        return nullptr;
+    }
+
+    // Node-targeted allocation (malloc_on v1.1,
+    // node_targeted_allocation.md §5): claim a contiguous slot run whose
+    // segments are ALL backed by `node`, growing remote-backed segments
+    // (one 128MB segment = 64 slots per successful try_grow_node) until
+    // the run fits or growth fails. Returns nullptr when the request
+    // cannot be satisfied on that node — the caller applies NodeFallback.
+    // Mirrors allocate()'s alignment and PR #19's geometric bound +
+    // growth loop; the only difference is the node-filtered claim and
+    // the node-riding grow.
+    void* allocate_on(ThreadId id, size_t size, uint32_t node) {
+        size_t page_size = SIZE_PAGE;
+        size_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
+        size_t slot_count =
+            (aligned_size + HugeSize::SLAB_SIZE - 1) / HugeSize::SLAB_SIZE;
+
+        if (slot_count > MAX_HUGE_SLOTS) return nullptr;
+
+        HugeDescriptor out;
+        void* p = scan_and_claim(shared, region_base, id, aligned_size,
+                                 slot_count, out, node);
+        if (p) return p;
+
+        NodeGrowFn fn = grow_fn_huge_on().load(std::memory_order_acquire);
+        while (fn && active_slot_count(shared) < MAX_HUGE_SLOTS
+               && shared->try_grow_node(fn, node)) {
+            p = scan_and_claim(shared, region_base, id, aligned_size,
+                               slot_count, out, node);
+            if (p) return p;
+        }
         return nullptr;
     }
 

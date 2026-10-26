@@ -15,7 +15,8 @@
  *   MON-4  fallbacks on unroutable node (POSIX: node 1): Fail→nullptr,
  *          Local/Any→valid local pointer
  *   MON-5  invalid node (>= MAX_PROCESSES): same fallback matrix
- *   MON-6  Huge size: fallback applied per flag (no node targeting in v1)
+ *   MON-6  Huge size: node targeting on a valid node (single- and
+ *          multi-segment runs) + fallback matrix on unroutable nodes
  *   MON-7  coexistence: interleaved malloc/malloc_on(0),
  *          publish/lookup of a malloc_on pointer, free all
  *   MON-8  C API: uballoc_malloc_on + enum values + node helpers
@@ -175,23 +176,46 @@ void mon_fallback(const std::string& heap, uint32_t node, const char* label) {
 // ---------------------------------------------------------------------------
 // MON-6: Huge size applies the fallback (no node targeting in v1)
 // ---------------------------------------------------------------------------
-void mon6_huge_fallback(const std::string& heap) {
-    std::cout << "[MON-6] Huge size fallback..." << std::endl;
+void mon6_huge_targeting_and_fallback(const std::string& heap) {
+    std::cout << "[MON-6] Huge size: node targeting + fallback matrix..." << std::endl;
     ar_set_heap_id(heap);
     ar_parent_init();
 
-    constexpr size_t kHuge = 8 * 1024 * 1024;  // > Large max (2MB) -> Huge
+    constexpr size_t kHuge = 8 * 1024 * 1024;          // > Large max (2MB) -> Huge, 4 slots
+    constexpr size_t kMulti = 130ULL * 1024 * 1024;    // 65 slots -> crosses 2 segments
 
-    void* f = uballoc::malloc_on(kHuge, 0, uballoc::NodeFallback::Fail);
-    assert(f == nullptr && "Huge + Fail must return nullptr in v1");
+    // v1.1: a VALID node target works for Huge (node 0 = the only node on
+    // POSIX). Single-segment and multi-segment runs both land on it.
+    {
+        void* p = uballoc::malloc_on(kHuge, 0, uballoc::NodeFallback::Fail);
+        assert(p && "Huge + valid node + Fail must succeed (v1.1)");
+        assert(uballoc::node_index_of(p) == 0);
+        std::memset(p, 0xC3, 4096);
+        uballoc::free(p);
+    }
+    {
+        void* p = uballoc::malloc_on(kMulti, 0, uballoc::NodeFallback::Fail);
+        assert(p && "Huge multi-segment (130MB) + valid node must succeed");
+        assert(uballoc::node_index_of(p) == 0);
+        std::memset(p, 0x3C, 4096);
+        uballoc::free(p);
+        // Capacity reuse: a second multi-segment claim reuses freed slots.
+        void* q = uballoc::malloc_on(kMulti, 0, uballoc::NodeFallback::Fail);
+        assert(q && uballoc::node_index_of(q) == 0);
+        uballoc::free(q);
+    }
 
-    void* l = uballoc::malloc_on(kHuge, 0, uballoc::NodeFallback::Local);
-    assert(l != nullptr && "Huge + Local must fall back to plain malloc");
+    // Unroutable node (POSIX: any node != 0): fallback matrix.
+    void* f = uballoc::malloc_on(kHuge, 1, uballoc::NodeFallback::Fail);
+    assert(f == nullptr && "Huge + unroutable + Fail must return nullptr");
+
+    void* l = uballoc::malloc_on(kHuge, 1, uballoc::NodeFallback::Local);
+    assert(l != nullptr && "Huge + unroutable + Local must fall back");
     std::memset(l, 0xC3, 4096);
     uballoc::free(l);
 
     uballoc::reset();
-    std::cout << "  OK" << std::endl;
+    std::cout << "  OK (targeting on valid node, fallback on unroutable)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +405,140 @@ void ubse_p1_worker() {
     uballoc::reset();
     std::cout << "  OK: data verified on the lender node" << std::endl;
 }
+// ---------------------------------------------------------------------------
+// UBSE 2-node Huge cross stress (v1.1 node-targeted Huge).
+//   P0 (node A): N x malloc_on(BYTES, node 1)  -> memory on node B
+//   P1 (node B): N x malloc_on(BYTES, node 0)  -> memory on node A
+// Both sides hold simultaneously (peak = 2 x N x BYTES of fabric memory),
+// verify data integrity cross-node, then free. Defaults: 10 x 2GB per
+// node (20GB each direction). Override with UBALLOC_HUGE_ON_BYTES /
+// UBALLOC_HUGE_ON_ROUNDS.
+// ---------------------------------------------------------------------------
+static size_t huge_on_bytes() {
+    const char* env = ::getenv("UBALLOC_HUGE_ON_BYTES");
+    unsigned long long v = env ? std::strtoull(env, nullptr, 0) : 0;
+    return v ? static_cast<size_t>(v) : (2ULL << 30);
+}
+static int huge_on_rounds() {
+    const char* env = ::getenv("UBALLOC_HUGE_ON_ROUNDS");
+    int v = env ? std::atoi(env) : 0;
+    return (v > 0) ? v : 10;
+}
+
+static void huge_pattern_write(void* p, size_t bytes, uint8_t tag, int round) {
+    uint8_t* cp = static_cast<uint8_t*>(p);
+    const size_t stride = 1ULL << 20;  // touch every 1MB
+    for (size_t off = 0; off < bytes; off += stride)
+        cp[off] = static_cast<uint8_t>(tag ^ (round & 0xFF) ^ ((off >> 20) & 0xFF));
+    cp[bytes - 1] = static_cast<uint8_t>(tag ^ 0xA5 ^ (round & 0xFF));
+}
+static bool huge_pattern_verify(void* p, size_t bytes, uint8_t tag, int round) {
+    uint8_t* cp = static_cast<uint8_t*>(p);
+    const size_t stride = 1ULL << 20;
+    for (size_t off = 0; off < bytes; off += stride)
+        if (cp[off] != static_cast<uint8_t>(tag ^ (round & 0xFF) ^ ((off >> 20) & 0xFF)))
+            return false;
+    return cp[bytes - 1] == static_cast<uint8_t>(tag ^ 0xA5 ^ (round & 0xFF));
+}
+
+// Markers on a distinct heap (cluster-visible shm_exists polling).
+static void huge_mk(const std::string& name) {
+    using P = uballoc::UBShmProvider;
+    auto c = P::shm_try_create(P::shm_name(name, 0, 0), P::min_shm_size);
+    assert(uballoc::is_ok(c));
+    P::shm_close_fd(uballoc::unwrap(c));
+}
+static bool huge_wait_mk(const std::string& name, int secs = 600) {
+    using P = uballoc::UBShmProvider;
+    const std::string n = P::shm_name(name, 0, 0);
+    for (int i = 0; i < secs; ++i) {
+        if (P::shm_exists(n)) return true;
+        ::sleep(1);
+    }
+    return P::shm_exists(n);
+}
+
+static void huge_cross_common(bool is_p0) {
+    using P = uballoc::UBShmProvider;
+    const std::string heap = ubse_heap_name();
+    const std::string mk = std::string(ubse_ack_name()) + "-hm";
+    const size_t bytes = huge_on_bytes();
+    const int rounds = huge_on_rounds();
+    const uint32_t target = is_p0 ? kRemoteNode : 0;   // each targets the OTHER node
+    const uint8_t tag = is_p0 ? 0xB0 : 0x0B;
+    const char* role = is_p0 ? "P0" : "P1";
+
+    std::cout << "[UBSE-HUGE-" << role << "] " << rounds << " x "
+              << (bytes >> 30) << "GB on node " << target << "..." << std::endl;
+
+    if (is_p0) {
+        ar_set_heap_id(heap);
+        ar_parent_init();
+        huge_mk(mk + "-start");
+        // Target node must have a live rank before the first remote grow.
+        for (int i = 0; i < 600; ++i) {
+            if (ar_alloc().backend().node_slot_id_of(kRemoteNode) != 0) break;
+            ::sleep(1);
+        }
+    } else {
+        assert(huge_wait_mk(mk + "-start"));
+        ar_set_heap_id(heap);
+        ar_parent_init();
+        assert(uballoc::node_index_local() == 1);
+    }
+
+    std::vector<void*> ptrs;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < rounds; ++r) {
+        auto tr = std::chrono::steady_clock::now();
+        void* p = uballoc::malloc_on(bytes, target, uballoc::NodeFallback::Fail);
+        if (!p) {
+            std::cout << "  round " << r << ": malloc_on FAILED (nullptr)"
+                      << " — pool/quota exhausted?" << std::endl;
+        }
+        assert(p && "malloc_on(bytes, target, Fail) must succeed");
+        assert(uballoc::node_index_of(p) == target);
+        huge_pattern_write(p, bytes, tag, r);
+        ptrs.push_back(p);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - tr).count();
+        std::cout << "  round " << r << ": ptr=" << p << " ("
+                  << ms << " ms)" << std::endl;
+    }
+    auto total_s = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::steady_clock::now() - t0).count();
+
+    huge_mk(mk + "-alloc-" + role);
+    if (is_p0) assert(huge_wait_mk(mk + "-alloc-P1"));
+
+    // Both sides now hold their full allocation set — verify integrity.
+    for (int r = 0; r < rounds; ++r)
+        assert(huge_pattern_verify(ptrs[r], bytes, tag, r));
+    std::cout << "  " << role << ": " << rounds << " x " << (bytes >> 30)
+              << "GB verified on remote node (" << total_s << "s alloc)"
+              << std::endl;
+
+    for (void* p : ptrs) uballoc::free(p);
+    huge_mk(mk + "-freed-" + role);
+    if (is_p0) assert(huge_wait_mk(mk + "-freed-P1"));
+
+    // Clean the markers.
+    for (const char* sfx : {"-start", "-alloc-P0", "-alloc-P1", "-freed-P0", "-freed-P1"}) {
+        P::shm_unlink(P::shm_name(mk + sfx, 0, 0));
+    }
+    uballoc::reset();
+    std::cout << "  " << role << ": freed + reset done" << std::endl;
+}
+
+void ubse_p0_huge_cross() {
+    std::cout << "[UBSE-HUGE-P0] cross-node huge stress..." << std::endl;
+    huge_cross_common(true);
+}
+void ubse_p1_huge_cross() {
+    std::cout << "[UBSE-HUGE-P1] cross-node huge stress..." << std::endl;
+    huge_cross_common(false);
+}
+
 #endif  // UBALLOC_USE_UBSE
 
 }  // namespace
@@ -391,6 +549,7 @@ int main() {
     const bool is_p1 = role && std::string(role) == "P1";
     if (is_p1) {
         ubse_p1_worker();
+        ubse_p1_huge_cross();
         std::cout << "\n=== malloc_on UBSE P1 passed ===" << std::endl;
         return 0;
     }
@@ -410,7 +569,7 @@ int main() {
     ar_pre_case_cleanup(id + "_5");
     mon_fallback(id + "_5", 100, "invalid node index");
     ar_pre_case_cleanup(id + "_6");
-    mon6_huge_fallback(id + "_6");
+    mon6_huge_targeting_and_fallback(id + "_6");
     ar_pre_case_cleanup(id + "_7");
     mon7_coexistence(id + "_7");
     ar_pre_case_cleanup(id + "_8");
@@ -424,6 +583,7 @@ int main() {
 
 #ifdef UBALLOC_USE_UBSE
     ubse_p0_remote_growth();
+    ubse_p0_huge_cross();
 #endif
 
     cleanup_all_distributed_shms(2, id);

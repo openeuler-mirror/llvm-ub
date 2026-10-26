@@ -47,6 +47,22 @@ inline std::atomic<NodeGrowFn>& grow_fn_large_on() {
     return fn;
 }
 
+inline std::atomic<NodeGrowFn>& grow_fn_huge_on() {
+    static std::atomic<NodeGrowFn> fn{nullptr};
+    return fn;
+}
+
+// Backing node of a huge slot (flat slot index within the owning rank's
+// huge VA space) -> SegmentDescriptor.provider_node of the segment the
+// slot lives in (slot / HUGE_SLOTS_PER_SEGMENT). Injected by
+// GlobalAllocator::init(); UINT32_MAX = unknown/unmapped.
+using HugeSlotBackingFn = uint32_t(*)(size_t);
+
+inline std::atomic<HugeSlotBackingFn>& huge_slot_backing_node_fn() {
+    static std::atomic<HugeSlotBackingFn> fn{nullptr};
+    return fn;
+}
+
 using CheckRemoteFn = bool(*)();
 
 inline std::atomic<CheckRemoteFn>& check_remote_fn() {

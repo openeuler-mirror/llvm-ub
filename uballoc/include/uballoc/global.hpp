@@ -398,6 +398,11 @@ public:
         slab_backing_node_fn<Large>().store(
             &GlobalAllocator<BackendT>::slab_backing_large_static,
             std::memory_order_release);
+        grow_fn_huge_on().store(&GlobalAllocator<BackendT>::grow_huge_on_static,
+                                std::memory_order_release);
+        huge_slot_backing_node_fn().store(
+            &GlobalAllocator<BackendT>::huge_slot_backing_static,
+            std::memory_order_release);
         grow_fn_huge().store(&GlobalAllocator<BackendT>::grow_huge_static,
                               std::memory_order_release);
         check_remote_fn().store(&GlobalAllocator<BackendT>::check_remote_segments_static,
@@ -820,6 +825,8 @@ public:
         grow_fn_small().store(nullptr, std::memory_order_release);
         grow_fn_large().store(nullptr, std::memory_order_release);
         grow_fn_huge().store(nullptr, std::memory_order_release);
+        grow_fn_huge_on().store(nullptr, std::memory_order_release);
+        huge_slot_backing_node_fn().store(nullptr, std::memory_order_release);
         grow_fn_small_on().store(nullptr, std::memory_order_release);
         grow_fn_large_on().store(nullptr, std::memory_order_release);
         slab_backing_node_fn<Small>().store(nullptr, std::memory_order_release);
@@ -1219,6 +1226,22 @@ public:
     static bool grow_huge_static() {
         return GlobalAllocator<BackendT>::get().grow_segment(2);
     }
+    static bool grow_huge_on_static(uint32_t node) {
+        return GlobalAllocator<BackendT>::get().grow_segment(2, node);
+    }
+    // Backing node of a huge slot (flat index within OUR rank's slot
+    // space). Mirrors slab_backing_impl: SegmentDescriptor.provider_node.
+    static uint32_t huge_slot_backing_static(size_t slot) {
+        auto& ga = GlobalAllocator<BackendT>::get();
+        size_t seg = slot / HUGE_SLOTS_PER_SEGMENT;
+        if (seg >= MAX_SEGMENTS) return UINT32_MAX;
+        SegmentDirectory* dir = ga.backend_.segment_directory(ga.rank_, 2);
+        if (!dir) return UINT32_MAX;
+        if (seg >= dir->count.load(std::memory_order_acquire)) return UINT32_MAX;
+        if (dir->descs[seg].ready.load(std::memory_order_acquire) != 1u)
+            return UINT32_MAX;
+        return dir->descs[seg].provider_node;
+    }
 
     static bool check_remote_segments_static() {
         GlobalAllocator<BackendT>::get().check_remote_segments();
@@ -1553,7 +1576,7 @@ public:
             // segments at 128MB VA boundaries. Ladder segments would break
             // this flat addressing since slots 2+ would land outside the
             // first segment's 4MB shm range.
-            auto res = backend_.create_data_segment(2, HUGE_SLOTS_PER_SEGMENT);
+            auto res = backend_.create_data_segment(2, HUGE_SLOTS_PER_SEGMENT, provider_node);
             if (is_err(res)) return false;
 
             huge_shared_ptrs_[rank_]->segment_count_.fetch_add(1, std::memory_order_release);
@@ -1689,9 +1712,9 @@ public:
     }
 
     // Logical backing node of an allocation (SegmentDescriptor.provider_node
-    // of the slab's segment). UINT32_MAX for non-uballoc pointers, Huge
-    // allocations (no node targeting in v1), or segments whose owning
-    // rank's metadata is not mapped locally.
+    // of the segment). UINT32_MAX for non-uballoc pointers, huge
+    // allocations of a remote rank whose metadata is not mapped locally,
+    // or unknown segments.
     uint32_t node_index_of(const void* ptr) {
         if (!ptr || !initialized_) return UINT32_MAX;
         auto& a = current_allocator();
@@ -1708,7 +1731,20 @@ public:
             SlabIndex<Large> idx = a.large.data->into_index(*lo);
             return slab_backing_impl(*a.large.slabs, idx, 1);
         }
-        return UINT32_MAX;  // Huge or foreign pointer
+        // Huge (v1.1): our rank's flat slot space. Ranks are spaced by
+        // PROCESS_STRIDE_HUGE (1.5TB) > the 1TB active slot window, so a
+        // pointer inside our window cannot belong to another rank.
+        {
+            uintptr_t off = reinterpret_cast<uintptr_t>(ptr)
+                - reinterpret_cast<uintptr_t>(a.huge.region_base);
+            if (off < MAX_HUGE_SLOTS * HugeSize::SLAB_SIZE) {
+                auto fn = huge_slot_backing_node_fn().load(
+                    std::memory_order_acquire);
+                if (!fn) return UINT32_MAX;
+                return fn(static_cast<size_t>(off / HugeSize::SLAB_SIZE));
+            }
+        }
+        return UINT32_MAX;  // foreign pointer (or un-mapped remote rank)
     }
 
     // Combined malloc+publish: allocates `size` bytes and publishes the pointer

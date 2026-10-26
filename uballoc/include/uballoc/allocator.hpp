@@ -181,10 +181,10 @@ struct Allocator {
     }
 
     // Node-targeted allocation (malloc_on, node_targeted_allocation.md §5).
-    // Routes Small/Large through the backing-filtered owned lists and
-    // node-targeted growth; Huge has no node targeting in v1 and applies
-    // the fallback directly. The pop-retry loop mirrors allocate()'s
-    // reclaim-race handling.
+    // Small/Large: backing-filtered owned lists + node-targeted growth,
+    // with a pop-retry loop mirroring allocate()'s reclaim-race handling.
+    // Huge (v1.1): node-filtered slot claim + node-targeted segment growth.
+    // Fallback applies when the target node cannot satisfy the request.
     void* allocate_on(size_t size, uint32_t node, NodeFallback fallback) {
         auto apply_fallback = [&]() -> void* {
             if (fallback == NodeFallback::Fail) return nullptr;
@@ -222,7 +222,13 @@ struct Allocator {
             return apply_fallback();
         }
 
-        // Huge: no node targeting in v1 — apply the fallback.
+        // Huge (v1.1): node-filtered slot claim + node-targeted growth.
+        // No pop-retry loop needed — huge claims are single-CAS, no
+        // reclaim race with the owned lists.
+        {
+            void* ptr = huge.allocate_on(thread_id, size, node);
+            if (ptr) return ptr;
+        }
         return apply_fallback();
     }
 
