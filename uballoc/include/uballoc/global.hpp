@@ -1816,8 +1816,13 @@ public:
                     REGISTRY_CHUNK_BYTES,
                     entry_bytes - static_cast<size_t>(c) * REGISTRY_CHUNK_BYTES);
                 // Round to 2 MiB (the UBSE shm granularity; POSIX is
-                // unaffected — the file is simply created this size).
-                size_t eff = (chunk_bytes + 0x1FFFFFULL) & ~0x1FFFFFULL;
+                // unaffected — the file is simply created this size) and clamp
+                // to the provider minimum (UBSE rejects creates below 4 MB);
+                // mapping more than needed is harmless — the flat index
+                // arithmetic only touches the first chunk_bytes of a chunk.
+                size_t eff = std::max(
+                    static_cast<size_t>((chunk_bytes + 0x1FFFFFULL) & ~0x1FFFFFULL),
+                    static_cast<size_t>(BackendT::ShmProvider::min_shm_size));
                 std::string name = backend_.registry_shm_name(c);
                 auto res = backend_.shm_try_create_registry(name, eff);
                 if (is_err(res)) {
@@ -1877,7 +1882,9 @@ public:
                 size_t chunk_bytes = std::min(
                     REGISTRY_CHUNK_BYTES,
                     entry_bytes - static_cast<size_t>(c) * REGISTRY_CHUNK_BYTES);
-                size_t eff = (chunk_bytes + 0x1FFFFFULL) & ~0x1FFFFFULL;
+                size_t eff = std::max(
+                    static_cast<size_t>((chunk_bytes + 0x1FFFFFULL) & ~0x1FFFFFULL),
+                    static_cast<size_t>(BackendT::ShmProvider::min_shm_size));
                 std::string name = backend_.registry_shm_name(c);
                 auto res = backend_.shm_attach_registry(name);
                 if (is_err(res)) {
