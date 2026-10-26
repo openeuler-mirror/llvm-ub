@@ -104,6 +104,14 @@ struct Allocator {
         thread_id = id;
         if (owned_array) {
             size_t local_idx = id.get() - rank * num_cores;
+            // Thread ids are GLOBAL: rank r's threads occupy
+            // [r*num_cores, (r+1)*num_cores). An id below this rank's
+            // block (e.g. a locally-numbered id like init_thread(0) on a
+            // rank>0 process) underflows and would index the per-rank
+            // owned array far out of bounds.
+            assert(local_idx < num_cores
+                   && "thread id outside this rank's block — use global ids "
+                      "(rank*num_cores + local)");
             owned = &(*owned_array)[ThreadId(local_idx)];
         }
         if (distributed_shared) {

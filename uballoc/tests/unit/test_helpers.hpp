@@ -80,12 +80,17 @@ inline void ar_pre_case_cleanup(const std::string& heap_id) {
 }
 
 // Parent-side (P0) init: env must already be set.
+// NOTE: no init_thread(0) here — thread ids are GLOBAL per-rank blocks
+// ([rank*num_cores, (rank+1)*num_cores)); pinning id 0 is only valid for
+// rank 0. On a rank>0 process it underflows focus()'s local_idx and
+// corrupts/asserts. Auto-registration (ensure_thread_init) hands out the
+// correct global id for every rank, and for rank 0 it is 0 — identical to
+// the old explicit call.
 inline void ar_parent_init() {
     auto& alloc = ar_alloc();
     alloc.soft_reset();
     alloc.init();
     assert(alloc.is_initialized());
-    alloc.init_thread(0);
 }
 
 // Child-side init after fork. soft_reset() clears inherited fork state.

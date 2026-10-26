@@ -260,7 +260,12 @@ struct UBShmProvider {
         // (see reregister_log_callback() comment for rationale).
         reregister_log_callback();
 
-        return shm_attach_inner(name, false);
+        // nc=true: a create with a REMOTE provider makes the creator a
+        // cross-node borrower of its own segment — open() then REQUIRES
+        // O_SYNC (plain O_RDWR gets EPERM on the UBSE device driver).
+        // For a local provider (slot 0) the self-map check inside
+        // shm_attach_inner disables O_SYNC, so behavior is unchanged.
+        return shm_attach_inner(name, true);
     }
 
     static Result<ShmHandle> shm_attach_inner(const std::string& name, bool nc) {

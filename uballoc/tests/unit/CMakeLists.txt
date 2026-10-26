@@ -31,6 +31,13 @@ set(UBALLOC_UNIT_TEST_TARGETS
 foreach(_target ${UBALLOC_UNIT_TEST_TARGETS})
     add_executable(${_target} ${_target}.cpp)
     target_include_directories(${_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # Match the uballoc_tests target: instantiate the templates inside the
+    # test binary. Without this, the test's inlined free functions (e.g.
+    # node_index_of -> current_allocator) can bind to libuballoc.so's
+    # instantiation while init_thread() writes the executable's own
+    # thread_local copies — the split TLS leaves tl_thread_id_ garbage in
+    # whichever copy runs the rebuild, tripping the ThreadId assert.
+    target_compile_definitions(${_target} PRIVATE UBALLOC_NO_EXTERN_TEMPLATE)
     target_link_libraries(${_target} PRIVATE uballoc rt pthread)
 endforeach()
 

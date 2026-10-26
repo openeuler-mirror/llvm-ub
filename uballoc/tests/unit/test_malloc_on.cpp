@@ -416,6 +416,12 @@ int main() {
     ar_pre_case_cleanup(id + "_8");
     mon8_c_api(id + "_8");
 
+    // Post-case sweep: reset() deletes data segments but not the
+    // heap-level registry (it is heap-lifetime state and may still have
+    // users); without this sweep every case leaks one registry shm.
+    for (int i = 1; i <= 8; ++i)
+        cleanup_all_distributed_shms(2, id + "_" + std::to_string(i));
+
 #ifdef UBALLOC_USE_UBSE
     ubse_p0_remote_growth();
 #endif
