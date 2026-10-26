@@ -26,7 +26,12 @@ inline size_t align_up(size_t val, size_t align) {
 
 struct SharedLayout {
     static constexpr uint64_t MAGIC = 0x55BA110C00001ULL;
-    static constexpr uint32_t LAYOUT_VERSION = 8;
+    // Bumped 8→9 by PR #19: Huge slot-value encoding changed from
+    // (count<<16)|1 to (count<<1)|1, and HugeSharedDynamicLayout is now
+    // initialized (slots array points to the 4MB array in metadata instead
+    // of the fixed 1024-entry slots[]). Mixed-version processes on the same
+    // heap would silently misread slot state and corrupt each other.
+    static constexpr uint32_t LAYOUT_VERSION = 9;
 
     uint64_t magic;
     uint32_t layout_version;
