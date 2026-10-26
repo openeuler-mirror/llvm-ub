@@ -12,15 +12,20 @@ set(UBALLOC_UNIT_TEST_TARGETS
     test_introspection
     test_defrag_hints
     test_ar01_va_layout
+    test_ar02_bootstrap_pid
+    test_ar03_lazy_init
     test_ar04_explicit_init
     test_ar05_size_classes
     test_ar06_realloc
+    test_ar07_heap_growth
+    test_ar08_remote_attach
     test_ar09_publish_lookup
     test_ar10_publishing_malloc
     test_ar11_stl_containers
     test_ar12_sigsegv_handler
     test_ar13_userfaultfd
-    test_ar14_ubse_provider)
+    test_ar14_ubse_provider
+    test_ar15_cleanup)
 
 foreach(_target ${UBALLOC_UNIT_TEST_TARGETS})
     add_executable(${_target} ${_target}.cpp)
