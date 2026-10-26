@@ -352,7 +352,7 @@ public:
         // If wire_up_process(rank) failed (CRC mismatch on self metadata),
         // it returns without setting up pointers. Abort init cleanly.
         if (small_shared_ptrs_[rank] == nullptr) {
-            LOG_ERROR("init: wire_up_process(rank) failed — aborting init");
+            LOG_WARN("init: wire_up_process(rank) failed — aborting init");
             return;
         }
         if (rank != 0) {
@@ -361,7 +361,7 @@ public:
             // timeout), it returns without setting up P0's pointers.
             // Abort init cleanly — caller checks is_initialized().
             if (small_shared_ptrs_[0] == nullptr) {
-                LOG_ERROR("init: wire_up_process(0) failed — aborting init");
+                LOG_WARN("init: wire_up_process(0) failed — aborting init");
                 return;
             }
         }
@@ -548,14 +548,14 @@ public:
                     if (stored == actual) break;
                     // CRC mismatch — treat as not-ready, retry
                     if ((crc_retries % CRC_LOG_INTERVAL) == 0) {
-                        LOG_ERROR("wire_up_process: P0 metadata CRC mismatch"
+                        LOG_WARN("wire_up_process: P0 metadata CRC mismatch"
                                   << " (stored=0x" << std::hex << stored
                                   << " actual=0x" << actual << std::dec
                                   << ") retry " << crc_retries
                                   << "/" << CRC_MAX_RETRIES);
                     }
                     if (++crc_retries >= CRC_MAX_RETRIES) {
-                        LOG_ERROR("wire_up_process: P0 metadata CRC mismatch"
+                        LOG_WARN("wire_up_process: P0 metadata CRC mismatch"
                                   << " — giving up after " << CRC_MAX_RETRIES
                                   << " retries, aborting init"
                                   << " (P0 layout_version=" << p0_layout->layout_version
@@ -569,7 +569,7 @@ public:
                     // ready_flag not set yet — count toward retry budget
                     // to avoid waiting forever if P0 crashed mid-init
                     if (++crc_retries >= CRC_MAX_RETRIES) {
-                        LOG_ERROR("wire_up_process: P0 ready_flag timeout"
+                        LOG_WARN("wire_up_process: P0 ready_flag timeout"
                                   << " (" << CRC_MAX_RETRIES << "ms) — aborting");
                         return;
                     }
@@ -587,7 +587,7 @@ public:
                 uint32_t stored = layout->crc32;
                 uint32_t actual = layout->compute_checksum();
                 if (stored != actual) {
-                    LOG_ERROR("wire_up_process: self metadata CRC mismatch"
+                    LOG_WARN("wire_up_process: self metadata CRC mismatch"
                               << " (stored=0x" << std::hex << stored
                               << " actual=0x" << actual << std::dec
                               << ") — aborting wire_up_process");

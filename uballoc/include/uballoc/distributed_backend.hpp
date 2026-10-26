@@ -511,16 +511,11 @@ public:
     // advancing, measured with the READER's own local clock. This makes
     // the mechanism correct across nodes with different CLOCK_MONOTONIC
     // epochs.
-    //
-    // flush+fence ensures cache-coherence on non-coherent devices (UBSE),
-    // matching the discipline used by set_slot_ready and bootstrap writes.
     void write_heartbeat() {
         if (!bootstrap_block_ || rank_ < 0) return;
         if (!heartbeat_enabled_) return;
         bootstrap_block_->slots[rank_].heartbeat_seq
             .fetch_add(1, std::memory_order_release);
-        flush(&bootstrap_block_->slots[rank_].heartbeat_seq, Invalidate::No);
-        fence();
     }
 
     // Return true if peer_rank's heartbeat is stale.
@@ -1803,7 +1798,7 @@ public:
         uint32_t stored_crc = dir->descs[seg_idx].crc32;
         uint32_t actual_crc = dir->descs[seg_idx].compute_checksum();
         if (stored_crc != actual_crc) {
-            LOG_ERROR("attach_data_segment: P" << remote_pid << " seg=" << seg_idx
+            LOG_WARN("attach_data_segment: P" << remote_pid << " seg=" << seg_idx
                      << " CRC mismatch (stored=0x" << std::hex << stored_crc
                      << " actual=0x" << actual_crc << std::dec << ") — skipping");
             return Error(ErrorKind::Shm, "segment descriptor CRC mismatch");
