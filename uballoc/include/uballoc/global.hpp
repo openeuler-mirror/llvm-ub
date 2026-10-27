@@ -674,9 +674,18 @@ public:
         tl_thread_initialized_ = true;
     }
 
+    // finalize(): explicit teardown before exit. Wraps reset() (which now
+    // calls uffd_uninstall()/fh_uninstall() at the START, fixing UBSE 1005
+    // where g_uffd_ctor_bs_mmap was still active during shm_detach_by_name).
+    // Call this before main() returns to avoid the ~GlobalAllocator
+    // destructor's race with UBSE SDK's __cxa_atexit ordering (ret=20).
+    void finalize() {
+        reset();
+    }
+
     void reset() {
         if (!initialized_) return;
-
+        
         // Stop HeartbeatThread first
         stop_heartbeat_thread();
 
@@ -690,6 +699,17 @@ public:
             else
 		reclaim_thread_.reset();
         }
+
+        // Uninstall uffd + SIGSEGV/SIGBUS handlers AFTER heartbeat/reclaim
+        // threads stop (safety net retained during teardown) and BEFORE any
+        // detach. uffd_uninstall munmaps the constructor(102)'s bootstrap
+        // mapping (g_uffd_ctor_bs_mmap), which MUST precede
+        // shm_detach_by_name in unmap_bootstrap_mapping below — otherwise
+        // OBMM rejects the detach with 1005 (active mmap on device-backed
+        // shm). uffd_uninstall/fh_uninstall are idempotent, so the second
+        // call inside soft_reset() (end of reset()) is a no-op.
+        uffd_uninstall(/*is_fork_child=*/false);
+        fh_uninstall();
 
         if constexpr (BackendT::ShmProvider::has_reliable_unreferenced_check) {
             // UBSE: full cleanup (same as destructor, since fork children
@@ -1933,6 +1953,10 @@ inline PublishedInfo lookup_by_address(void* ptr) {
 
 inline void reset() {
     get_global_allocator().reset();
+}
+
+inline void finalize() {
+    get_global_allocator().finalize();
 }
 
 inline void soft_reset() {

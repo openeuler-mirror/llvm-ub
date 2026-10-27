@@ -182,5 +182,7 @@ int main() {
     uballoc::purge();
 
     std::cout << "\n=== Defrag example complete ===" << std::endl;
+
+    uballoc::finalize();
     return 0;
 }

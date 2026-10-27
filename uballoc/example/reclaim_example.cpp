@@ -184,7 +184,7 @@ static int run_p0() {
     }
     std::cout << "\n  P0 complete." << std::endl;
     sleep_ms(2000);  // keep alive for P1 to discover TYPE_P0_DONE
-    uballoc::reset();
+    uballoc::finalize();
     return 0;
 }
 
@@ -241,7 +241,7 @@ static int run_p1() {
     std::cout << "  P0 completed." << std::endl;
     print_stats("p1-final");
 
-    uballoc::reset();
+    uballoc::finalize();
     return 0;
 }
 

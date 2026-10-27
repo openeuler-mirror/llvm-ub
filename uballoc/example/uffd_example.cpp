@@ -96,6 +96,8 @@ int main(int argc, char** argv) {
         std::cout << "  P0: P1 signaled done (message='" << block->message << "')" << std::endl;
 
         uballoc::free(block);
+
+        uballoc::finalize();
         return 0;
     }
 
@@ -137,5 +139,6 @@ int main(int argc, char** argv) {
 
     std::cout << "  P1: test passed — uffd handler coexists with eager attach" << std::endl;
 
+    uballoc::finalize();
     return 0;
 }

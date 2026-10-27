@@ -135,5 +135,7 @@ int main(int argc, char* argv[]) {
     // Keep alive briefly so the peer can finish and exit cleanly before
     // our uballoc destructor runs (avoids teardown races on shared state).
     sleep(1);
+
+    uballoc::finalize();
     return 0;
 }

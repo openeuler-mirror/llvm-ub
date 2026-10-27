@@ -157,17 +157,26 @@ bool uballoc_enable_userfaultfd(void);
 void uballoc_disable_userfaultfd(void);
 
 /* -------------------------------------------------------------------------
- * Reset functions.
+ * Reset / finalize functions.
  *
  * uballoc_reset(): full teardown — detaches/deletes shms (UBSE) or
  * unlinks them (POSIX), then clears all state. Call this when a process
  * is done with the allocator and wants to re-init with a different
  * heap_id.
  *
+ * uballoc_finalize(): same as uballoc_reset() but intended for exit-time
+ * cleanup. On UBSE builds this MUST be called on every exit path before
+ * `main()` returns — omitting it can hang the process at exit and leave
+ * stale shms that block subsequent allocations until the UBSE daemon is
+ * restarted (the ~GlobalAllocator destructor races with the UBSE SDK's
+ * __cxa_atexit teardown). On POSIX the destructor path is reliable, so
+ * finalize() is optional (recommended for portability).
+ *
  * uballoc_soft_reset(): clears in-memory state WITHOUT touching shms.
  * Used by fork children that inherited the parent's state.
  * ------------------------------------------------------------------------- */
 void uballoc_reset(void);
+void uballoc_finalize(void);
 void uballoc_soft_reset(void);
 
 /* Returns true if the allocator has been initialized. */

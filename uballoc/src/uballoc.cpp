@@ -81,6 +81,10 @@ void uballoc_reset(void) {
     uballoc::get_global_allocator().reset();
 }
 
+void uballoc_finalize(void) {
+    uballoc::get_global_allocator().finalize();
+}
+
 void uballoc_soft_reset(void) {
     uballoc::get_global_allocator().soft_reset();
 }

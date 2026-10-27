@@ -47,7 +47,7 @@ uballoc分配器的快速入门，包括环境变量配置、双节点示例运�
 |---------|---------|
 | [快速入门](#快速入门) | 介绍uballoc的基本概念、安装部署、环境变量、双节点示例及性能验证，帮助用户快速上手。 |
 | [安装指南](#安装指南) | 详细介绍uballoc的已验证环境、CMake选项、编译产物、分发包生成（tarball）、下游消费方式及卸载方式。 |
-| [API参考](#api参考) | API分为**基础API**（`init`/`malloc`/`malloc_published`/`free`/`realloc`/`lookup_by_type*`/`shm_new`/`shm_delete`，绝大多数应用只需此组）与**可选/高级API**（`memalign`/`publish`/`unpublish`/`lookup_by_address`/`rank`/`total_processes`/`is_owner`/`is_initialized`/`reset`/`enable_*fault_handler`），提供详细说明与使用示例。 |
+| [API参考](#api参考) | API分为**基础API**（`init`/`malloc`/`malloc_published`/`free`/`realloc`/`lookup_by_type*`/`shm_new`/`shm_delete`，绝大多数应用只需此组）与**可选/高级API**（`memalign`/`publish`/`unpublish`/`lookup_by_address`/`rank`/`total_processes`/`is_owner`/`is_initialized`/`reset`/`finalize`/`enable_*fault_handler`），提供详细说明与使用示例。 |
 | [常见问题](#常见问题) | 汇总用户高频关注的行为语义与使用约束，涵盖`realloc`缩容语义、发布/查找的进程生命周期要求、跨进程释放限制等。 |
 
 ## 贡献声明
@@ -460,7 +460,7 @@ uballoc是专为aarch64架构、Linux操作系统下多进程多节点分布式�
 uballoc的API分为两类：
 
 - **基础API**：`init`、`malloc`、`malloc_published`、`free`、`realloc`、`lookup_by_type`、`lookup_by_type_blocking`、`shm_new`/`shm_delete`（含`pub_tid`合并发布重载）。绝大多数应用只需使用这一组API即可完成跨进程共享内存的分配、重分配、发布、发现与释放。
-- **可选/高级API**：`memalign`、`publish`、`unpublish`、`lookup_by_address`、`rank`、`total_processes`、`is_owner`、`is_initialized`、`reset`、`enable_fault_handler`/`disable_fault_handler`、`enable_userfaultfd`/`disable_userfaultfd`。这些API不是必须的——通常用于对齐分配、手动发布/取消发布、查询集群状态、fault handler回退或完全重置分配器等高级场景。
+- **可选/高级API**：`memalign`、`publish`、`unpublish`、`lookup_by_address`、`rank`、`total_processes`、`is_owner`、`is_initialized`、`reset`、`finalize`、`enable_fault_handler`/`disable_fault_handler`、`enable_userfaultfd`/`disable_userfaultfd`。这些API不是必须的——通常用于对齐分配、手动发布/取消发布、查询集群状态、fault handler回退或完全重置分配器等高级场景。其中`finalize`用于进程退出前显式清理，修复UBSE环境下的ret=20/1005问题（详见[uballoc_finalize](#uballoc_finalize)章节）。
 
 线程ID在首次使用时自动分配，无需显式调用`init_thread`。
 
@@ -964,7 +964,7 @@ bool uballoc::is_initialized();
 
 **函数功能**
 
-完全清理并重置分配器状态。执行`uffd_uninstall()`→`fh_uninstall()`→`clear_bootstrap_slot()`→`detach_all_regions()`→`wait_for_unreferenced()`→`unlink_own_shms()`→`cleanup_bootstrap_mapping()`→`cleanup_bootstrap()`→`release_reservation()`，然后调用`soft_reset()`清空内存状态。fork子进程应使用`soft_reset()`而非`reset()`。
+完全清理并重置分配器状态。执行`stop_heartbeat_thread()`→`reclaim_thread_->stop()`→`uffd_uninstall()`→`fh_uninstall()`→`detach_all_regions()`→`clear_bootstrap_slot()`→`release_bootstrap_borrow()`→`unmap_bootstrap_mapping()`→`wait_for_unreferenced()`→`unlink_node_shms()`→`release_reservation()`，然后调用`soft_reset()`清空内存状态。fork子进程应使用`soft_reset()`而非`reset()`。
 
 **函数定义**
 
@@ -974,6 +974,33 @@ void uballoc::reset();
 
 // C API
 void uballoc_reset(void);
+```
+
+### uballoc_finalize
+
+**函数功能**
+
+在进程退出前显式清理分配器状态。语义上是`reset()`的包装，但修复了UBSE环境下的两个关键问题：
+
+1. **修复OBMM 1005（`OBMM_OP_FAILED`）**：`reset()`在停掉`HeartbeatThread`/`ReclaimThread`之后、任何 detach 之前调用`uffd_uninstall()`/`fh_uninstall()`（`uffd_uninstall`会在`shm_detach_by_name`之前munmap掉`g_uffd_ctor_bs_mmap`），避免OBMM驱动因设备-backed shm上仍有active mmap而拒绝detach（1005）。先停线程再卸载handler是为了保留安全网——这两个线程可能触发跨进程 shm 操作（如`check_remote_segments` attach 对端 metadata），UBSE 驱动会作为副作用销毁已映射VMA，若此时handler已卸载则进程硬崩溃。`uffd_uninstall`/`fh_uninstall`是幂等的（`g_uffd_active`/`g_fh_active`早退守卫），`reset()`末尾`soft_reset()`里的二次调用是no-op。
+
+2. **规避ret=20（`IPC_CONNECTION_FAILED`）**：UBSE SDK通过`__cxa_atexit`/`__cxa_finalize`在进程静态析构阶段销毁内部IPC状态，而`~GlobalAllocator`析构也在该阶段调用UBSE IPC。由于LIFO顺序和`__cxa_finalize`机制，`~GlobalAllocator`执行时SDK已死，`shm_detach`/`shm_unlink`返回ret=20，导致`wait_for_unreferenced`死循环或残留shm。`finalize()`在`main()` return前显式调用——此时SDK状态还活着，所有IPC调用成功，析构阶段因`initialized_`已被清成false而早退，不再触发UBSE IPC。
+
+**何时使用**
+
+- **UBSE 构建（`-DUBALLOC_USE_UBSE=ON`）：必须调用**。在 `main()` 的所有退出路径（含 `_exit`/错误退出）返回前调用 `uballoc::finalize()`（C++）或 `uballoc_finalize()`（C）。省略它会导致进程退出时挂起或残留 shm，这些 shm 阻塞后续分配，直到 UBSE 守护进程重启。原因是 UBSE SDK 在静态析构阶段销毁内部 IPC 状态，而 `~GlobalAllocator` 析构也在该阶段调用 UBSE IPC —— SDK 此时已死，IPC 调用失败。
+- **POSIX 后端：可选**。析构路径工作正常，`finalize()` 仅为一致性与可移植性建议调用。
+
+C++ 调用方：在所有 `return` 前加 `uballoc::finalize();`。C 调用方：加 `uballoc_finalize();`。
+
+**函数定义**
+
+```cpp
+// C++ API
+void uballoc::finalize();
+
+// C API
+void uballoc_finalize(void);
 ```
 
 ### uballoc_enable_fault_handler
@@ -1305,7 +1332,7 @@ Huge分配的`class_size`返回`slot_count * SLAB_SIZE`（SLAB_SIZE=2MB），而
 
 ### 核心原则
 
-**拥有共享内存的进程在退出（或调用`reset()`）前，必须确保其他进程已完成对该数据的所有访问。** 违反此原则会导致数据不可访问（查找超时）或进程崩溃（SIGBUS）。
+**拥有共享内存的进程在退出（或调用`finalize()`）前，必须确保其他进程已完成对该数据的所有访问。** 违反此原则会导致数据不可访问（查找超时）或进程崩溃（SIGBUS）。
 
 ### 两个阶段，两种后果
 
@@ -1348,6 +1375,7 @@ P0访问失效页面 → SIGBUS ✗          ← 阶段二：P1不能在此前�
 // P1: 通知完成后sleep
 uballoc::publish(reinterpret_cast<void*>(1), 0, TYPE_P1_DONE);
 sleep(2);  // 保持存活，让P0完成shm_delete
+uballoc::finalize();  // 显式清理——避免ret=20/1005
 return 0;
 
 // P0: 收到通知后执行shm_delete，然后sleep
@@ -1355,6 +1383,7 @@ auto done = uballoc::lookup_by_type_blocking(TYPE_P1_DONE, 30000);
 // ... 验证数据 ...
 uballoc::shm_delete(vec);  // 析构遍历P1数据段（P1仍存活）
 sleep(2);  // 保持存活，让P1的cleanup在P0退出后运行
+uballoc::finalize();
 return 0;
 ```
 
@@ -1367,6 +1396,7 @@ return 0;
 uballoc::publish(&done_flag, sizeof(done_flag), TYPE_P1_DONE);
 // 等待P0确认shm_delete完成
 auto p0_done = uballoc::lookup_by_type_blocking(TYPE_P0_DELETE_DONE, 30000);
+uballoc::finalize();
 return 0;
 
 // P0: 收到P1完成 → shm_delete → 通知P1可以退出
@@ -1374,6 +1404,7 @@ auto done = uballoc::lookup_by_type_blocking(TYPE_P1_DONE, 30000);
 // ... 验证数据 ...
 uballoc::shm_delete(vec);
 uballoc::publish(&done_flag, sizeof(done_flag), TYPE_P0_DELETE_DONE);
+uballoc::finalize();
 return 0;
 ```
 
@@ -1401,12 +1432,13 @@ cfg->ready.store(2, std::memory_order_release);  // 通知发布方
 ### 不应做的事
 
 - 不要在信号"完成"后立即退出 — 对方进程需要时间完成`shm_delete`
-- 不要在其他进程访问你的数据时调用`reset()`
+- 不要在其他进程访问你的数据时调用`finalize()`或`reset()`
 - 不要假设库会阻止跨节点映射失效 — 这是UBSE设备行为，库无法拦截
 
 ### 库提供的能力
 
 - `publish()` / `lookup_by_type_blocking()` — 数据发现与同步
+- `finalize()` — 显式清理并退出，修复ret=20/1005，替代依赖析构的隐式清理（见`uballoc_finalize`章节）
 - 发布方进入cleanup后，消费方仍可发现其数据（bootstrap slot在`wait_for_unreferenced`期间保持`ready=1`）
 - `wait_for_unreferenced()` 在所有 peer 心跳停止推进或硬超时后继续推进，不再永久挂起；正常退出场景下 shms 仍自动清理无残留
 - 死 peer 检测：自动强制释放死亡 peer 的借用段（munmap + close fd + 标记 DETACHED）
