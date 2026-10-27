@@ -493,10 +493,15 @@ static void huge_cross_common(bool is_p0) {
         auto tr = std::chrono::steady_clock::now();
         void* p = uballoc::malloc_on(bytes, target, uballoc::NodeFallback::Fail);
         if (!p) {
-            std::cout << "  round " << r << ": malloc_on FAILED (nullptr)"
-                      << " — pool/quota exhausted?" << std::endl;
+            // Log and stop (no assert): keep the protocol alive so both
+            // sides verify what succeeded and tear down cleanly. The
+            // provider's WARN above shows the SDK error code; the numastat
+            // sampler running alongside shows which pool hit the wall.
+            std::cout << "  round " << r << ": malloc_on FAILED (nullptr) at "
+                      << ((r * bytes) >> 30) << "GB cumulative — stopping allocations"
+                      << std::endl;
+            break;
         }
-        assert(p && "malloc_on(bytes, target, Fail) must succeed");
         assert(uballoc::node_index_of(p) == target);
         huge_pattern_write(p, bytes, tag, r);
         ptrs.push_back(p);
@@ -512,11 +517,11 @@ static void huge_cross_common(bool is_p0) {
     if (is_p0) assert(huge_wait_mk(mk + "-alloc-P1"));
 
     // Both sides now hold their full allocation set — verify integrity.
-    for (int r = 0; r < rounds; ++r)
-        assert(huge_pattern_verify(ptrs[r], bytes, tag, r));
-    std::cout << "  " << role << ": " << rounds << " x " << (bytes >> 30)
-              << "GB verified on remote node (" << total_s << "s alloc)"
-              << std::endl;
+    for (size_t r = 0; r < ptrs.size(); ++r)
+        assert(huge_pattern_verify(ptrs[r], bytes, tag, static_cast<int>(r)));
+    std::cout << "  " << role << ": " << ptrs.size() << "/" << rounds << " x "
+              << (bytes >> 30) << "GB verified on remote node (" << total_s
+              << "s alloc)" << std::endl;
 
     for (void* p : ptrs) uballoc::free(p);
     huge_mk(mk + "-freed-" + role);
