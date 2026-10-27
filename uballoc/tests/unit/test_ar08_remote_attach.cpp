@@ -421,14 +421,22 @@ void dt08_5_lookup_by_address_scan_only(const std::string& heap_id) {
         ::close(p2_to_p1[0]);
         auto* remote = reinterpret_cast<void*>(v);
  
-        // Phase 1 — scan-only: P2's registry is NOT mapped in P1.
-        // Verify by checking that P2's metadata region is null.
+        // Phase 1 — scan-only: no ATTACH is triggered by
+        // lookup_by_address. V2 shared registry (million-type-id
+        // registry, remote-allocation branch): the registry is a single
+        // shared shm mapped by every process, so P2's publish IS
+        // discoverable by P1 without mapping P2's metadata region — the
+        // V1 premise ("P2's registry unmapped -> owner == -1") no longer
+        // holds. The contract that matters: the lookup does NOT trigger
+        // check_remote_segments (metadata_regions_[2] stays unmapped).
         auto& backend = ar_alloc().backend();
         assert(backend.metadata_regions_[2].address == nullptr);
  
         auto pre = uballoc::lookup_by_address(remote);
-        assert(pre.owner_process == -1);
-        assert(backend.metadata_regions_[2].address == nullptr);  // unchanged
+        assert(pre.address == remote);      // found via the shared registry
+        assert(pre.owner_process == 2);     // V2: visible without attach
+        assert(pre.type_id == TID_C);
+        assert(backend.metadata_regions_[2].address == nullptr);  // attach NOT triggered
  
         // Phase 2 — lookup_by_type triggers check_remote_segments, attaches P2.
         auto via_type = uballoc::lookup_by_type(TID_C);
@@ -457,7 +465,7 @@ void dt08_5_lookup_by_address_scan_only(const std::string& heap_id) {
     waitpid(pid1, &st1, 0);
     check_child(st1);
     ar_alloc().reset();
-    std::cout << "  OK: scan-only returns -1, post-attach returns owner" << std::endl;
+    std::cout << "  OK: scan-only (no attach), shared-registry discovery, post-attach returns owner" << std::endl;
 }
 
 #ifdef UBALLOC_USE_UBSE
