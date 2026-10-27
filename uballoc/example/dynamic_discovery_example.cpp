@@ -115,5 +115,6 @@ int main(int argc, char** argv) {
     // our uballoc destructor runs (avoids teardown races on shared state).
     sleep(2);
 
+    uballoc::finalize();
     return 0;
 }

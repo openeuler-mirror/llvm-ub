@@ -75,6 +75,11 @@ uballoc::init();
 void* p = uballoc::malloc(64);
 // ... use p ...
 uballoc::free(p);
+
+// finalize() MUST be called before exit (UBSE builds; optional on POSIX).
+// Skipping it hangs the process at exit and leaves stale shms that
+// block subsequent allocations until the UBSE daemon is restarted.
+uballoc::finalize();
 ```
 
 Run the distributed example on two nodes:

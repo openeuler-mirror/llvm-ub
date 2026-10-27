@@ -306,5 +306,7 @@ int main(int argc, char** argv) {
     std::cout << "Freed: pub=" << pub << " small=" << p_s << " large=" << p_l << " huge=" << p_h << std::endl;
 
     std::cout << "\n=== Demo complete (P" << rank << ") ===" << std::endl;
+
+    uballoc::finalize();
     return 0;
 }

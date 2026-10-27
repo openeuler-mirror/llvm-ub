@@ -71,6 +71,10 @@ uballoc::init();
 void* p = uballoc::malloc(64);
 // ... 使用 p ...
 uballoc::free(p);
+
+// 退出前必须调用 finalize()（UBSE 构建必选；POSIX 后端可选）
+// 不调用会在进程退出时挂起或残留 shm，阻塞后续分配直到 UBSE 守护进程重启。
+uballoc::finalize();
 ```
 
 在两个节点上运行分布式示例：

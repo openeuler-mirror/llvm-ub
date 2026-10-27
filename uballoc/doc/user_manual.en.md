@@ -47,7 +47,7 @@ See [Quick Start](#quick-start) for environment-variable configuration, two-node
 |---------|-------------|
 | [Quick Start](#quick-start) | Introduces uballoc's basic concepts, installation, environment variables, two-node example, and performance verification. |
 | [Installation Guide](#installation-guide) | Details verified environments, CMake options, build artifacts, tarball generation, downstream consumption, and uninstall. |
-| [API Reference](#api-reference) | The API is split into **basic API** (`init`/`malloc`/`malloc_published`/`free`/`realloc`/`lookup_by_type*`/`shm_new`/`shm_delete` — sufficient for the vast majority of apps) and **optional/advanced API** (`memalign`/`publish`/`unpublish`/`lookup_by_address`/`rank`/`total_processes`/`is_owner`/`is_initialized`/`reset`/`enable_*fault_handler`). Detailed descriptions and examples are provided. |
+| [API Reference](#api-reference) | The API is split into **basic API** (`init`/`malloc`/`malloc_published`/`free`/`realloc`/`lookup_by_type*`/`shm_new`/`shm_delete` — sufficient for the vast majority of apps) and **optional/advanced API** (`memalign`/`publish`/`unpublish`/`lookup_by_address`/`rank`/`total_processes`/`is_owner`/`is_initialized`/`reset`/`finalize`/`enable_*fault_handler`). Detailed descriptions and examples are provided. |
 | [FAQ](#faq) | Summarizes high-frequency behavior semantics and usage constraints, including `realloc` shrink semantics, process-lifecycle requirements for publish/lookup, and cross-process free limitations. |
 
 ## Contributing
@@ -460,7 +460,7 @@ uballoc is a C++17 shared-memory allocator designed for aarch64-architecture, mu
 The uballoc API falls into two categories:
 
 - **Basic API**: `init`, `malloc`, `malloc_published`, `free`, `realloc`, `lookup_by_type`, `lookup_by_type_blocking`, `shm_new`/`shm_delete` (including the `pub_tid` merged-publish overload). The vast majority of applications need only this set to allocate, reallocate, publish, discover, and free cross-process shared memory.
-- **Optional/advanced API**: `memalign`, `publish`, `unpublish`, `lookup_by_address`, `rank`, `total_processes`, `is_owner`, `is_initialized`, `reset`, `enable_fault_handler`/`disable_fault_handler`, `enable_userfaultfd`/`disable_userfaultfd`. These are not required — they are typically used for aligned allocation, manual publish/unpublish timing, cluster-state queries, fault-handler fallback, or full allocator reset.
+- **Optional/advanced API**: `memalign`, `publish`, `unpublish`, `lookup_by_address`, `rank`, `total_processes`, `is_owner`, `is_initialized`, `reset`, `finalize`, `enable_fault_handler`/`disable_fault_handler`, `enable_userfaultfd`/`disable_userfaultfd`. These are not required — they are typically used for aligned allocation, manual publish/unpublish timing, cluster-state queries, fault-handler fallback, or full allocator reset. `finalize` is for explicit teardown before process exit, fixing ret=20/1005 in UBSE environments (see the [uballoc_finalize](#uballoc_finalize) section).
 
 Thread IDs are assigned automatically on first use — no explicit `init_thread` call is needed.
 
@@ -964,7 +964,7 @@ bool uballoc::is_initialized();
 
 **Function**
 
-Fully cleans up and resets allocator state. Executes `uffd_uninstall()` → `fh_uninstall()` → `clear_bootstrap_slot()` → `detach_all_regions()` → `wait_for_unreferenced()` → `unlink_own_shms()` → `cleanup_bootstrap_mapping()` → `cleanup_bootstrap()` → `release_reservation()`, then calls `soft_reset()` to clear in-memory state. Forked child processes should use `soft_reset()` instead of `reset()`.
+Fully cleans up and resets allocator state. Executes `stop_heartbeat_thread()` → `reclaim_thread_->stop()` → `uffd_uninstall()` → `fh_uninstall()` → `detach_all_regions()` → `clear_bootstrap_slot()` → `release_bootstrap_borrow()` → `unmap_bootstrap_mapping()` → `wait_for_unreferenced()` → `unlink_node_shms()` → `release_reservation()`, then calls `soft_reset()` to clear in-memory state. Forked child processes should use `soft_reset()` instead of `reset()`.
 
 **Definition**
 
@@ -974,6 +974,33 @@ void uballoc::reset();
 
 // C API
 void uballoc_reset(void);
+```
+
+### uballoc_finalize
+
+**Function**
+
+Explicitly tears down allocator state before process exit. Semantically a wrapper around `reset()`, but fixes two critical issues in the UBSE environment:
+
+1. **Fixes OBMM 1005 (`OBMM_OP_FAILED`)**: `reset()` calls `uffd_uninstall()` / `fh_uninstall()` AFTER stopping `HeartbeatThread` / `ReclaimThread` but BEFORE any detach (`uffd_uninstall` munmaps `g_uffd_ctor_bs_mmap` before any `shm_detach_by_name`), preventing the OBMM driver from rejecting the detach (1005) due to an active mmap on a device-backed shm. Threads are stopped before uninstalling the handler to retain the safety net — those threads may trigger cross-process shm ops (e.g., `check_remote_segments` attaches peer metadata) that destroy already-mapped VMAs as a UBSE driver side effect; with the handler already uninstalled the process would hard-crash. `uffd_uninstall` / `fh_uninstall` are idempotent (early-return guards on `g_uffd_active` / `g_fh_active`); the second call inside `reset()`'s trailing `soft_reset()` is a no-op.
+
+2. **Avoids ret=20 (`IPC_CONNECTION_FAILED`)**: The UBSE SDK tears down its internal IPC state during the static-destruction phase via `__cxa_atexit` / `__cxa_finalize`. The `~GlobalAllocator` destructor also runs in that phase and calls UBSE IPC — by which time the SDK is already dead (`shm_detach` / `shm_unlink` return ret=20, causing `wait_for_unreferenced` to loop forever or leaving residual shms). `finalize()` is called explicitly before `main()` returns, while the SDK state is still alive, so all IPC calls succeed; the destructor path is then short-circuited (because `initialized_` has been cleared to false) and no UBSE IPC is triggered.
+
+**When to use**
+
+- **UBSE builds (`-DUBALLOC_USE_UBSE=ON`): MUST call.** Call `uballoc::finalize()` (C++) or `uballoc_finalize()` (C) before returning from `main()` on every exit path (including `_exit` / error-exit). Omitting it can hang the process at exit and leave stale shms that block subsequent allocations until the UBSE daemon is restarted. The reason is that the UBSE SDK tears down its internal IPC state during the static-destruction phase, and the `~GlobalAllocator` destructor also runs in that phase and calls UBSE IPC — by which time the SDK is already dead.
+- **POSIX backend: optional.** The destructor path works normally; `finalize()` is recommended only for consistency and portability.
+
+C++ callers: add `uballoc::finalize();` before every `return`. C callers: add `uballoc_finalize();`.
+
+**Definition**
+
+```cpp
+// C++ API
+void uballoc::finalize();
+
+// C API
+void uballoc_finalize(void);
 ```
 
 ### uballoc_enable_fault_handler
@@ -1309,7 +1336,7 @@ Therefore, when calling `realloc` on a Huge allocation, the old and new pointers
 
 ### Core Principle
 
-**The process that owns shared memory must ensure that all other processes have finished accessing that data before exiting (or calling `reset()`).** Violating this principle leads to data inaccessibility (lookup timeout) or process crashes (SIGBUS).
+**The process that owns shared memory must ensure that all other processes have finished accessing that data before exiting (or calling `finalize()`).** Violating this principle leads to data inaccessibility (lookup timeout) or process crashes (SIGBUS).
 
 ### Two Phases, Two Consequences
 
@@ -1353,6 +1380,7 @@ P0 accesses invalid page → SIGBUS ✗ ← Phase 2: P1 must not exit before thi
 // P1: signal "done" then sleep
 uballoc::publish(reinterpret_cast<void*>(1), 0, TYPE_P1_DONE);
 sleep(2);  // stay alive so P0 can finish shm_delete
+uballoc::finalize();  // explicit teardown — avoids ret=20/1005, see uballoc_finalize
 return 0;
 
 // P0: after ack, do shm_delete, then sleep
@@ -1360,6 +1388,7 @@ auto done = uballoc::lookup_by_type_blocking(TYPE_P1_DONE, 30000);
 // ... verify data ...
 uballoc::shm_delete(vec);  // destructor traverses P1's data segment (P1 still alive)
 sleep(2);  // stay alive so P1's cleanup runs after P0 exits
+uballoc::finalize();
 return 0;
 ```
 
@@ -1372,6 +1401,7 @@ This pattern is verified in `stl_full_shm_example.cpp`.
 uballoc::publish(&done_flag, sizeof(done_flag), TYPE_P1_DONE);
 // wait for P0 to confirm shm_delete completion
 auto p0_done = uballoc::lookup_by_type_blocking(TYPE_P0_DELETE_DONE, 30000);
+uballoc::finalize();
 return 0;
 
 // P0: receive P1 done → shm_delete → notify P1 it can exit
@@ -1379,6 +1409,7 @@ auto done = uballoc::lookup_by_type_blocking(TYPE_P1_DONE, 30000);
 // ... verify data ...
 uballoc::shm_delete(vec);
 uballoc::publish(&done_flag, sizeof(done_flag), TYPE_P0_DELETE_DONE);
+uballoc::finalize();
 return 0;
 ```
 
@@ -1406,12 +1437,13 @@ Note: This pattern does not cover the `shm_delete` scenario. If the consumer mod
 ### What Not to Do
 
 - Do not exit immediately after signaling "done" — the peer needs time to complete `shm_delete`.
-- Do not call `reset()` while other processes are accessing your data.
+- Do not call `finalize()` or `reset()` while other processes are accessing your data.
 - Do not assume the library can prevent cross-node mapping invalidation — this is UBSE device behavior the library cannot intercept.
 
 ### What the Library Provides
 
 - `publish()` / `lookup_by_type_blocking()` — data discovery and synchronization.
+- `finalize()` — explicit cleanup and exit, fixes ret=20/1005, replacing the implicit destructor cleanup (see the `uballoc_finalize` section).
 - After the publisher enters cleanup, the consumer can still discover its data (the bootstrap slot stays `ready=1` during `wait_for_unreferenced`).
 - `wait_for_unreferenced()` proceeds after all peers are dead/silent (heartbeat stale) or a hard timeout — no longer hangs forever. Normal-exit scenarios still clean up shms automatically with no residue.
 - Dead-peer detection: force-releases a dead peer's borrowed segments (munmap + close fd + mark DETACHED).

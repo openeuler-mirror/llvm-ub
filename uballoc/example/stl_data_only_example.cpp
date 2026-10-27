@@ -214,5 +214,6 @@ int main(int argc, char** argv) {
         std::cout << "\n=== P1 complete ===" << std::endl;
     }
 
+    uballoc::finalize();
     return 0;
 }

@@ -129,6 +129,8 @@ int main(int argc, char** argv) {
 
         uballoc::free(block_b);
         uballoc::free(block_a);
+
+        uballoc::finalize();
         return 0;
     }
 
@@ -231,5 +233,6 @@ int main(int argc, char** argv) {
     std::cout << "  P1: test passed — uffd lazy-attached a remote segment on demand"
               << std::endl;
 
+    uballoc::finalize();
     return 0;
 }
