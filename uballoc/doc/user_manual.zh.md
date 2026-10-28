@@ -217,6 +217,7 @@ cmake -B build && cmake --build build -j
 | `share/uballoc/examples/` | 示例源码（9个`.cpp`）+ 独立`CMakeLists.txt`，供最终用户编译验证 |
 | `share/uballoc/scripts/cleanup_shms.sh` | POSIX环境残留shm清理脚本（基于`/dev/shm`文件路径） |
 | `share/uballoc/scripts/cleanup_shms_ub.sh` | UBSE环境残留shm清理脚本（基于`ubsectl`自动发现） |
+| `share/uballoc/scripts/run_examples.sh` | 双节点批量示例运行脚本。P0本机、P1经SSH远端执行，自动清理残留shm。用法：`./scripts/run_examples.sh [-v] <remote_host>`，`-v`显示详细输出 |
 
 **最终用户安装方式**
 
