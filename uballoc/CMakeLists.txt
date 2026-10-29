@@ -138,6 +138,7 @@ install(DIRECTORY example/
 install(PROGRAMS
     scripts/cleanup_shms.sh
     scripts/cleanup_shms_ub.sh
+    scripts/run_examples.sh
     DESTINATION share/uballoc/scripts
 )
 

@@ -216,6 +216,7 @@ Output: `build/uballoc-<version>-linux-<arch>.tar.gz` (e.g. `uballoc-0.6.0-linux
 | `share/uballoc/examples/` | Example sources (9 `.cpp` files) + standalone `CMakeLists.txt`, for end-user compile verification |
 | `share/uballoc/scripts/cleanup_shms.sh` | POSIX residual-shm cleanup script (based on `/dev/shm` file paths) |
 | `share/uballoc/scripts/cleanup_shms_ub.sh` | UBSE residual-shm cleanup script (based on `ubsectl` auto-discovery) |
+| `share/uballoc/scripts/run_examples.sh` | Two-node batch example runner. P0 local, P1 remote via SSH, with automatic residual-shm cleanup. Usage: `./scripts/run_examples.sh [-v] <remote_host>`, `-v` shows verbose output |
 
 **End-user install**
 
