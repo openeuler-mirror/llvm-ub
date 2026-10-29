@@ -100,6 +100,8 @@ struct SlabSlice {
     
     T* data() { return base_ + 1; }
     const T* data() const { return base_ + 1; }
+
+    bool is_registered() const { return base_ != nullptr; }
 };
 
 template<typename B>

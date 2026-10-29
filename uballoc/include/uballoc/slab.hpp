@@ -7,6 +7,7 @@
 #include <atomic>
 #include <optional>
 #include <cassert>
+#include <cstdio>
 #include <functional>
 #include <vector>
 #include <array>
@@ -45,8 +46,22 @@ struct SlabLocal {
     }
 
     void own(ThreadId id) {
-        assert(owner.load(std::memory_order_relaxed) == 0);
-        owner.store(id.internal(), std::memory_order_relaxed);
+        // CAS instead of assert+store to prevent check-then-act race
+        // when two threads (e.g., main thread + uffd/heartbeat/reclaim
+        // background thread) simultaneously bump-allocate the same slab.
+        uint16_t expected = 0;
+        if (!owner.compare_exchange_strong(
+                expected, id.internal(),
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            // Should not happen: bump allocator guarantees exclusive
+            // slab ownership. If it does, keep the first owner (the CAS
+            // winner) to avoid corruption.
+            std::fprintf(stderr,
+                "uballoc: own() slab already owned by %u, expected 0, caller=%u\n",
+                static_cast<unsigned>(owner.load(std::memory_order_relaxed)),
+                static_cast<unsigned>(id.internal()));
+        }
     }
 
     void steal(ThreadId id) {
@@ -54,8 +69,17 @@ struct SlabLocal {
     }
 
     void disown(ThreadId id) {
-        assert(owner.load(std::memory_order_relaxed) == id.internal());
-        owner.store(0, std::memory_order_relaxed);
+        // CAS instead of assert+store to prevent concurrent disown race.
+        uint16_t expected = id.internal();
+        if (!owner.compare_exchange_strong(
+                expected, 0,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            std::fprintf(stderr,
+                "uballoc: disown() owner mismatch, expected=%u actual=%u\n",
+                static_cast<unsigned>(id.internal()),
+                static_cast<unsigned>(owner.load(std::memory_order_relaxed)));
+        }
     }
 };
 
@@ -388,6 +412,15 @@ struct SlabStackGlobal {
                 }
 
                 idx = *old_state.inner;
+                // Check if the segment for this slab index is registered.
+                // If not (check_remote_segments race), return nullopt to
+                // fall back to bump allocation instead of crashing.
+                int pid = slabs.find_process(idx.get());
+                size_t local_idx = idx.get() - slabs.cumulative[pid];
+                auto [seg, seg_local] = slabs.find_segment(pid, local_idx);
+                if (!slabs.local_slices[pid][seg].is_registered()) {
+                    return std::nullopt;
+                }
                 uint32_t next = slabs.local(idx).next.load(std::memory_order_relaxed);
                 std::optional<SlabIndex<B>> new_inner = (next > 0) ?
                     std::optional<SlabIndex<B>>(SlabIndex<B>::unpack(next)) : std::nullopt;
