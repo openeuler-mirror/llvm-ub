@@ -104,11 +104,22 @@ strip_slot() {
 echo "=== Phase 0: discover shms matching prefix '${PREFIX}' ==="
 echo "  querying ubsectl display memory -t borrow_detail -bt share ..."
 
-RAW_OUTPUT=$(ubsectl display memory -t borrow_detail -bt share 2>/dev/null)
+RAW_OUTPUT=$(ubsectl display memory -t borrow_detail -bt share 2>&1)
 if [ -z "$RAW_OUTPUT" ]; then
     echo "  ubsectl returned no output (no shms in cluster, or ubsectl unavailable)."
     echo "  Nothing to clean up."
     exit 0
+fi
+
+# ubsectl reports errors (e.g. UBS_ERR_PERMISSION_DENIED=30 under RBAC roles)
+# by printing "ERROR: ..." to stdout/stderr while STILL exiting 0. Detect this
+# so callers can distinguish "cleaned successfully" from "could not query" via
+# a non-zero exit (run_examples.sh's cleanup() relies on this).
+if echo "$RAW_OUTPUT" | grep -q "ERROR"; then
+    echo "  ERROR: ubsectl returned an error (likely permission denied or unavailable):"
+    echo "$RAW_OUTPUT" | grep "ERROR" | sed 's/^/    /'
+    echo "  Cannot discover/clean up residual shms. Aborting cleanup."
+    exit 2
 fi
 
 # Parse the table.  We mimic UBSE's own UbseCliTableParser
