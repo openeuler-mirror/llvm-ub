@@ -112,12 +112,17 @@ if [ -z "$RAW_OUTPUT" ]; then
 fi
 
 # ubsectl reports errors (e.g. UBS_ERR_PERMISSION_DENIED=30 under RBAC roles)
-# by printing "ERROR: ..." to stdout/stderr while STILL exiting 0. Detect this
-# so callers can distinguish "cleaned successfully" from "could not query" via
-# a non-zero exit (run_examples.sh's cleanup() relies on this).
-if echo "$RAW_OUTPUT" | grep -q "ERROR"; then
-    echo "  ERROR: ubsectl returned an error (likely permission denied or unavailable):"
-    echo "$RAW_OUTPUT" | grep "ERROR" | sed 's/^/    /'
+# by printing "ERROR: ..." to stdout/stderr while STILL exiting 0. A valid
+# successful query returns a table whose header contains "borrow_node" and
+# "lend_node"; use that as the POSITIVE signal rather than grep "ERROR", which
+# would misfire on a shm whose name happens to contain "ERROR". When the query
+# does not yield a valid table, exit non-zero so callers (run_examples.sh's
+# cleanup()) can distinguish "cleaned successfully" from "could not query".
+if ! echo "$RAW_OUTPUT" | grep -q "borrow_node"; then
+    echo "  ERROR: ubsectl did not return a valid table (likely permission"
+    echo "  denied, UBS_ERR_PERMISSION_DENIED=30, or ubsectl unavailable)."
+    echo "  First non-empty line of output:"
+    echo "$RAW_OUTPUT" | grep -v '^[[:space:]]*$' | head -1 | sed 's/^/    /'
     echo "  Cannot discover/clean up residual shms. Aborting cleanup."
     exit 2
 fi

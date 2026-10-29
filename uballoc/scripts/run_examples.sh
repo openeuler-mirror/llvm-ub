@@ -129,33 +129,51 @@ if ! "${SSH_CMD[@]}" "echo ok" >/dev/null 2>&1; then
 fi
 echo "  SSH OK (local -> $REMOTE_HOST)."
 
-# 2. ubsectl availability + permission on local node (cleanup depends on it).
+# 2. ubsectl availability + permission on local node.
+#    ubsectl is the management CLI used by cleanup_shms_ub.sh to discover
+#    residual shms. RBAC may deny it (UBS_ERR_PERMISSION_DENIED=30) while the
+#    SDK data path (shm_create/attach) still works — examples themselves do
+#    NOT depend on ubsectl. So a permission failure is a WARNING, not fatal:
+#    cleanup will be counted as failed in the summary, but examples still run.
+#    ubsectl reports errors by printing "ERROR: ..." while STILL exiting 0,
+#    so we check the output content, not the exit code. Use a POSITIVE check
+#    (table header present) rather than grep "ERROR" — the latter would
+#    misfire on a shm whose name happens to contain "ERROR".
 echo "Checking ubsectl on local node..."
 if ! command -v ubsectl >/dev/null 2>&1; then
     echo "Error: ubsectl not found in PATH on local node."
     echo "cleanup_shms_ub.sh requires ubsectl to discover residual shms."
     exit 1
 fi
-if ubsectl display memory -t borrow_detail -bt share 2>&1 | grep -q "ERROR"; then
-    echo "Error: ubsectl on local node returned an error (likely permission"
-    echo "  denied, UBS_ERR_PERMISSION_DENIED=30 under the documented RBAC roles)."
-    echo "  Fix: run as a user with UBSE permission (or as root)."
-    exit 1
+if ! ubsectl display memory -t borrow_detail -bt share 2>&1 \
+        | grep -q "borrow_node"; then
+    echo "Warning: ubsectl on local node did not return a valid table"
+    echo "  (likely UBS_ERR_PERMISSION_DENIED=30 under the documented RBAC roles)."
+    echo "  cleanup_shms_ub.sh will fail; residual shms will accumulate and be"
+    echo "  counted in the final summary. Examples themselves do not require"
+    echo "  ubsectl permission and will still run. Continuing..."
 fi
 
-# 3. ubsectl on remote node (same output-content check as local)
+# 3. ubsectl on remote node (same positive header check as local)
 echo "Checking ubsectl on remote node ($REMOTE_HOST)..."
 if ! "${SSH_CMD[@]}" "command -v ubsectl >/dev/null 2>&1"; then
-    echo "Error: ubsectl not found in PATH on $REMOTE_HOST."
-    echo "  Remote cleanup and P1 examples require ubsectl permission. Aborting."
-    exit 1
-elif "${SSH_CMD[@]}" "ubsectl display memory -t borrow_detail -bt share 2>&1 | grep -q ERROR"; then
-    echo "Error: ubsectl on $REMOTE_HOST returned an error (likely permission"
-    echo "  denied). Remote P1 examples would segfault on first shm_create. Aborting."
-    exit 1
+    echo "Warning: ubsectl not found in PATH on $REMOTE_HOST."
+    echo "  Remote cleanup will fail; residual shms on $REMOTE_HOST will accumulate"
+    echo "  and be counted in the final summary. Examples still run. Continuing..."
+elif ! "${SSH_CMD[@]}" "ubsectl display memory -t borrow_detail -bt share 2>&1 \
+        | grep -q borrow_node"; then
+    echo "Warning: ubsectl on $REMOTE_HOST did not return a valid table"
+    echo "  (likely permission denied). Remote cleanup will fail; residual shms"
+    echo "  on $REMOTE_HOST will accumulate and be counted in the final summary."
+    echo "  Examples themselves do not require ubsectl permission. Continuing..."
 fi
 
 # 4. uffd availability probe (required by fault_handler_example).
+#    On hardened kernels (openEuler/RHEL default), vm.unprivileged_userfaultfd=0
+#    makes userfaultfd(2) fail with EPERM for non-root users; the library then
+#    degrades to a SIGSEGV handler that cannot discover+attach previously-unseen
+#    segments. Root is never restricted by this sysctl. This carries the SKIP
+#    decision basis for fault_handler_example below.
 probe_uffd_local() {
     local v
     v=$(cat /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || echo "?")
@@ -201,9 +219,10 @@ separator() {
 }
 
 # Clean up residual shms (local + remote). cleanup_shms_ub.sh exits non-zero
-# (exit 2) when ubsectl reports ERROR (e.g. permission denied), so failures are
-# caught here and counted in CLEANUP_FAILURES for the final summary. Output is
-# suppressed for readability.
+# (exit 2) when ubsectl does not return a valid table (e.g. permission denied),
+# so failures are caught here and counted in CLEANUP_FAILURES for the final
+# summary. Output is suppressed for readability; failures are non-fatal —
+# examples do not depend on ubsectl permission.
 CLEANUP_FAILURES=0
 cleanup() {
     local heap_id="$1"
