@@ -563,7 +563,6 @@ inline bool fh_install() {
                 strerror(errno));
         return false;
     }
-    g_fh_installed.store(true, std::memory_order_release);
 
     // Install the SIGBUS handler (catches uffd_poison delivery + truncated
     // shm access). Same flags as SIGSEGV. Installed even when uffd is
@@ -582,6 +581,11 @@ inline bool fh_install() {
                 strerror(errno));
         // Non-fatal — SIGSEGV handler is still installed.
     }
+
+    // Mark installed only after both sigaction calls (success or
+    // non-fatal SIGBUS failure) — prevents a SIGBUS-only failure from
+    // short-circuiting future retries.
+    g_fh_installed.store(true, std::memory_order_release);
 
     g_fh_active.store(true, std::memory_order_release);
     return true;
