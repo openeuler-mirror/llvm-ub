@@ -14,6 +14,7 @@
 #include <algorithm>
 
 #include "packed.hpp"
+#include "log.hpp"
 #include "thread.hpp"
 #include "size.hpp"
 #include "data.hpp"
@@ -45,17 +46,44 @@ struct SlabLocal {
     }
 
     void own(ThreadId id) {
-        assert(owner.load(std::memory_order_relaxed) == 0);
-        owner.store(id.internal(), std::memory_order_relaxed);
+        // CAS instead of assert+store to prevent check-then-act race
+        // when two threads (e.g., main thread + uffd/heartbeat/reclaim
+        // background thread) simultaneously bump-allocate the same slab.
+        // If CAS fails, the slab is already owned by another thread —
+        // this is a fatal invariant violation (bump allocator guarantees
+        // exclusive slab ownership).
+        uint16_t expected = 0;
+        if (!owner.compare_exchange_strong(
+                expected, id.internal(),
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            LOG_ERROR("own() slab already owned by "
+                     << owner.load(std::memory_order_relaxed)
+                     << ", expected 0, caller=" << id.internal());
+        }
     }
 
     void steal(ThreadId id) {
-        owner.store(id.internal(), std::memory_order_relaxed);
+        // steal() is an unconditional store — it transfers ownership
+        // from the global free list to the calling thread. This is safe
+        // because pop() guarantees exclusive access (CAS on the head).
+        // own() uses CAS (new slab from bump), steal() uses store
+        // (existing slab from free list) — the distinction is intentional.
+        owner.store(id.internal(), std::memory_order_release);
     }
 
     void disown(ThreadId id) {
-        assert(owner.load(std::memory_order_relaxed) == id.internal());
-        owner.store(0, std::memory_order_relaxed);
+        // CAS instead of assert+store to prevent concurrent disown race.
+        // If CAS fails, owner is not us — fatal invariant violation.
+        uint16_t expected = id.internal();
+        if (!owner.compare_exchange_strong(
+                expected, 0,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            LOG_ERROR("disown() owner mismatch, expected="
+                     << id.internal() << " actual="
+                     << owner.load(std::memory_order_relaxed));
+        }
     }
 };
 
@@ -371,10 +399,16 @@ struct SlabStackGlobal {
             help->store(id, id, ver);
         }
 
+        // Best-effort: if a slab index points to an unregistered segment
+        // (check_remote_segments race), trigger discovery and retry up to
+        // 3 times before giving up and falling back to bump allocation.
+        int unregistered_retries = 0;
         while (true) {
-            uint64_t old_raw;
-            uint64_t new_raw;
+            uint64_t old_raw = 0;
+            uint64_t new_raw = 0;
             SlabIndex<B> idx{0};
+            SlabLocal<B>* slab_ptr = nullptr;
+            bool skip_cas = false;
 
             do {
                 old_raw = head.raw_.load(std::memory_order_acquire);
@@ -388,7 +422,30 @@ struct SlabStackGlobal {
                 }
 
                 idx = *old_state.inner;
-                uint32_t next = slabs.local(idx).next.load(std::memory_order_relaxed);
+                // Best-effort probe: if the segment for this slab index
+                // has not been registered yet (check_remote_segments race),
+                // trigger discovery and retry pop instead of returning
+                // nullopt (which would cause a false malloc failure when
+                // memory is actually available).
+                int pid = slabs.find_process(idx.get());
+                size_t local_idx = idx.get() - slabs.cumulative[pid];
+                auto [seg, seg_local] = slabs.find_segment(pid, local_idx);
+                if (!slabs.local_slices[pid][seg].is_registered()) {
+                    // Segment not registered yet — trigger discovery
+                    // so register_segment runs, then retry pop.
+                    if (unregistered_retries < 3) {
+                        auto check_fn = check_remote_fn().load(std::memory_order_acquire);
+                        if (check_fn) check_fn();
+                        unregistered_retries++;
+                        skip_cas = true;
+                        break;  // exit do-while, while(true) retries
+                    }
+                    return std::nullopt;  // give up, caller falls back to bump
+                }
+                // Reuse pid/seg/seg_local to avoid redundant find_process/
+                // find_segment calls inside local(idx).
+                slab_ptr = &slabs.local_slices[pid][seg][SlabIndex<B>(seg_local)];
+                uint32_t next = slab_ptr->next.load(std::memory_order_relaxed);
                 std::optional<SlabIndex<B>> new_inner = (next > 0) ?
                     std::optional<SlabIndex<B>>(SlabIndex<B>::unpack(next)) : std::nullopt;
 
@@ -398,10 +455,12 @@ struct SlabStackGlobal {
             } while (!head.raw_.compare_exchange_weak(old_raw, new_raw,
                      std::memory_order_acq_rel, std::memory_order_relaxed));
 
+            if (skip_cas) continue;  // retry while(true)
+
             flush(&head.raw_, Invalidate::No);
             fence();
 
-            if (slabs.local(idx).detached.load(std::memory_order_relaxed) == 0) {
+            if (slab_ptr->detached.load(std::memory_order_relaxed) == 0) {
                 return idx;
             }
         }

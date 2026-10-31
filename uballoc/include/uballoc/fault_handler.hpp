@@ -104,6 +104,7 @@ inline std::atomic<uintptr_t> g_fh_va_end{0};
 // (e.g., jemalloc's bootstrap fault handler, language runtimes, profilers).
 // Stored as a plain struct (not atomic) — written once at install time
 // under no concurrent signal, read by the handler.
+inline std::atomic<bool> g_fh_installed{false};  // fh_install() done (sigaction called)
 inline struct sigaction g_fh_old_sa;
 inline struct sigaction g_fh_old_sa_sigbus;
 
@@ -535,6 +536,17 @@ inline void fh_sigbus_handler(int sig, siginfo_t* info, void* /*uctx*/) {
 // normal stack is unavailable (overflow/corruption), which is not our
 // case.
 inline bool fh_install() {
+    // Idempotency guard: if the handler was already installed, do NOT
+    // call sigaction again. A second sigaction() would save the
+    // currently-installed handler (uballoc's own fh_sigsegv_handler)
+    // into g_fh_old_sa, causing infinite recursion on any later chain
+    // (fh_chain_to_old → fh_sigsegv_handler → fh_chain_to_old → ...).
+    // This happens when constructor(102) installs first, then
+    // try_enable_uffd_locked() installs again.
+    if (g_fh_installed.load(std::memory_order_acquire)) {
+        return true;
+    }
+
     // Install the SIGSEGV handler.
     // SA_SIGINFO: use the 3-argument sa_sigaction (provides si_addr).
     // No SA_ONSTACK: run on the normal stack (no sigaltstack configured).
@@ -570,6 +582,11 @@ inline bool fh_install() {
         // Non-fatal — SIGSEGV handler is still installed.
     }
 
+    // Mark installed only after both sigaction calls (success or
+    // non-fatal SIGBUS failure) — prevents a SIGBUS-only failure from
+    // short-circuiting future retries.
+    g_fh_installed.store(true, std::memory_order_release);
+
     g_fh_active.store(true, std::memory_order_release);
     return true;
 }
@@ -580,6 +597,7 @@ inline void fh_uninstall() {
     if (!g_fh_active.load(std::memory_order_acquire)) return;
 
     g_fh_active.store(false, std::memory_order_release);
+    g_fh_installed.store(false, std::memory_order_release);
     ::sigaction(SIGSEGV, &g_fh_old_sa, nullptr);
     ::sigaction(SIGBUS, &g_fh_old_sa_sigbus, nullptr);
 

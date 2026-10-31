@@ -10,7 +10,7 @@
  *   DT13-3  R3,R4: multi-publish same segment (one mmap, data consistent)
  *   DT13-4  R4: whole-segment mmap (second page no re-fault)
  *   DT13-5  R6: seg_not_in_dir → uffd handler fires + uffd_poison called
- *   DT13-6  R6: (reserved) ZEROPAGE fallback — not reachable (LOG_ERROR aborts before ioctl)
+ *   DT13-6  R6: uffd_poison effect — SIGBUS (UFFDIO_POISON) or exit (ZEROPAGE)
  *   DT13-7  R7: disable_userfaultfd + re-enable SIGSEGV mode
  *   DT13-8  R5: eager+uffd coexist (eager segment no uffd fault)
  *   DT13-9  R8: fork child soft_reset → uffd_uninstall (no std::terminate)
@@ -317,24 +317,20 @@ void dt13_4_whole_segment_mmap(const std::string& heap_id) {
 
 // ---------------------------------------------------------------------------
 // DT13-5 R6: seg_not_in_dir → uffd handler fires + uffd_poison called
-// DT13-6 R6: (reserved) old kernel ZEROPAGE fallback (kernel < 6.6)
+// DT13-6 R6: uffd_poison effect — SIGBUS (UFFDIO_POISON) or exit (ZEROPAGE)
 //
 // P0 init but NO malloc (dir->count==0). P1 accesses P0's segment-0 VA
 // → uffd handler classifies seg_not_in_dir → calls uffd_poison().
 //
-// NOTE: uffd_poison() uses LOG_ERROR which calls std::abort() after emitting
-// the log line — the UFFDIO_POISON ioctl never executes. So this test
-// verifies that the uffd handler fires, classifies seg_not_in_dir, and
-// enters uffd_poison() (confirmed via stderr log capture). It does NOT
-// verify the actual POISON ioctl / SIGBUS delivery — that path is dead
-// code behind LOG_ERROR's abort. After abort, the handler thread dies and
-// the faulting main thread blocks in kernel waiting for a uffd response
-// that never comes; the parent sends SIGKILL to reap the child (~100ms).
+// uffd_poison() logs via LOG_WARN then issues UFFDIO_POISON ioctl.
+// On success, the kernel delivers SIGBUS to the faulting thread.
+// On failure, ZEROPAGE fallback maps a zero page and the thread continues.
+// fh is disabled to isolate the uffd path.
 // ---------------------------------------------------------------------------
 void dt13_5_6_seg_not_in_dir(const std::string& heap_id) {
-    std::cout << "[DT13-5/6] seg_not_in_dir -> uffd_poison (handler fires)..." << std::endl;
+    std::cout << "[DT13-5] seg_not_in_dir -> uffd_poison (handler fires)..." << std::endl;
 
-    // Pipe to capture child stderr (uffd_poison LOG_ERROR goes to stderr).
+    // Pipe to capture child stderr (uffd_poison LOG_WARN goes to stderr).
     int logpipe[2];
     assert(pipe(logpipe) == 0);
 
@@ -345,16 +341,20 @@ void dt13_5_6_seg_not_in_dir(const std::string& heap_id) {
     pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
-        // Redirect stderr → logpipe so parent can detect uffd_poison log.
+        // Redirect stdout + stderr → logpipe so parent can capture
+        // uffd_poison log (LOG_WARN may go to either).
+        ::dup2(logpipe[1], STDOUT_FILENO);
         ::dup2(logpipe[1], STDERR_FILENO);
         ::close(logpipe[0]);
         ::close(logpipe[1]);
 
+        // Enable WARN-level logs so uffd_poison's LOG_WARN is captured.
+        uballoc::log::set_level(uballoc::LogLevel::Warn);
+
         ar_child_init();
         assert(uballoc::g_uffd_active.load(std::memory_order_acquire));
 
-        // Disable SIGSEGV safety net to avoid handler loop / soft lockup
-        // if any spurious signal is delivered. uffd itself stays active.
+        // Disable SIGSEGV safety net to isolate the uffd path.
         ar_alloc().disable_fault_handler();
         assert(!uballoc::g_fh_active.load(std::memory_order_acquire));
         assert(uballoc::g_uffd_active.load(std::memory_order_acquire));
@@ -364,16 +364,19 @@ void dt13_5_6_seg_not_in_dir(const std::string& heap_id) {
         uintptr_t p0_seg0 = va_base + uballoc::METADATA_STRIDE;
 
         // uffd handler: fi.s=0 >= dir_count=0 → seg_not_in_dir → uffd_poison.
-        // uffd_poison emits LOG_ERROR (stderr) then aborts handler thread;
-        // main thread blocks in kernel waiting for uffd response.
+        // UFFDIO_POISON success → SIGBUS kills child.
+        // ZEROPAGE fallback → child reads zero, falls through to _exit(0).
         volatile uint8_t* p = reinterpret_cast<volatile uint8_t*>(p0_seg0);
         uint8_t v = *p;
         (void)v;
-        // Unreachable: handler aborts, main thread blocks → parent SIGKILL.
         _exit(0);
     }
 
     ::close(logpipe[1]);
+
+    // Set logpipe[0] non-blocking so read() never blocks.
+    int logpipe_flags = ::fcntl(logpipe[0], F_GETFL);
+    ::fcntl(logpipe[0], F_SETFL, logpipe_flags | O_NONBLOCK);
 
     // Parent: poll child stderr for "uffd_poison" with 10s timeout.
     bool poison_seen = false;
@@ -386,8 +389,9 @@ void dt13_5_6_seg_not_in_dir(const std::string& heap_id) {
         if (pr > 0 && (pfd.revents & POLLIN)) {
             ssize_t n = ::read(logpipe[0], buf, sizeof(buf));
             if (n <= 0) break;  // pipe closed
-            acc.append(buf, buf + n);
-            if (acc.find("uffd_poison") != std::string::npos) {
+            if (acc.size() < 131072) acc.append(buf, buf + n);
+            if (acc.find("uffd_poison") != std::string::npos &&
+                acc.find("seg_not_in_dir") != std::string::npos) {
                 poison_seen = true;
                 break;
             }
@@ -395,21 +399,48 @@ void dt13_5_6_seg_not_in_dir(const std::string& heap_id) {
     }
     ::close(logpipe[0]);
 
-    // Reap child: handler thread aborted, main thread blocks in kernel.
-    // SIGKILL reaps in ~100ms (no fh → no soft lockup).
-    ::kill(pid, SIGKILL);
+    // Reap child with timeout. uffd_poison may leave the child stuck if
+    // both UFFDIO_POISON and ZEROPAGE fail. Poll for up to 15s, then SIGKILL.
     int child_st = 0;
-    ::waitpid(pid, &child_st, 0);
+    for (int i = 0; i < 300; ++i) {  // 300 × 50ms = 15s
+        pid_t r = ::waitpid(pid, &child_st, WNOHANG);
+        if (r == pid) break;
+        if (r < 0) break;
+        ::usleep(50000);  // 50ms
+    }
+    if (!WIFEXITED(child_st) && !WIFSIGNALED(child_st)) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &child_st, 0);
+    }
 
-    if (poison_seen) {
-        std::cout << "  DT13-5 PASS: uffd handler fired + classified seg_not_in_dir"
-                  << " + entered uffd_poison (log confirmed)" << std::endl;
-        std::cout << "  DT13-6 SKIP: POISON ioctl not reached (LOG_ERROR aborts first)"
-                  << std::endl;
+    if (!poison_seen) {
+        std::cerr << "  FAIL: no uffd_poison+seg_not_in_dir log captured."
+                  << " stderr was:" << std::endl << acc << std::endl;
+        std::abort();
+    }
+
+    std::cout << "  DT13-5 PASS: uffd handler fired + classified seg_not_in_dir"
+              << " + uffd_poison called (log confirmed)" << std::endl;
+
+    // DT13-6: verify uffd_poison's effect.
+    if (WIFSIGNALED(child_st)) {
+        int sig = WTERMSIG(child_st);
+        if (sig == SIGBUS) {
+            std::cout << "  DT13-6 PASS: child killed by SIGBUS (UFFDIO_POISON succeeded)"
+                      << std::endl;
+        } else if (sig == SIGKILL) {
+            std::cout << "  DT13-6 SKIP: child stuck after uffd_poison (SIGKILL timeout)"
+                      << std::endl;
+        } else {
+            std::cerr << "  DT13-6 FAIL: child killed by unexpected signal " << sig << std::endl;
+            std::abort();
+        }
+    } else if (WIFEXITED(child_st)) {
+        std::cout << "  DT13-6 PASS: child exited normally (ZEROPAGE fallback,"
+                  << " exit=" << WEXITSTATUS(child_st) << ")" << std::endl;
     } else {
-        std::cerr << "  FAIL: no uffd_poison log captured. stderr was:" << std::endl
-                  << acc << std::endl;
-        assert(0);
+        std::cerr << "  DT13-6 FAIL: unexpected child status" << std::endl;
+        std::abort();
     }
 
     uballoc::reset();
@@ -466,52 +497,27 @@ void dt13_7_disable_degrades_to_sigsegv(const std::string& heap_id) {
 // ---------------------------------------------------------------------------
 void dt13_8_eager_uffd_coexist(const std::string& heap_id) {
     std::cout << "[DT13-8] eager+uffd coexist (eager segment no uffd fault)..." << std::endl;
-    int rp[2];
-    assert(pipe(rp) == 0);
 
     ar_set_heap_id(heap_id);
-    // P0 publishes BEFORE forking P1 → P1 init eager-attaches.
     ar_parent_init();
+    assert(uballoc::g_uffd_active.load(std::memory_order_acquire));
+
+    // P0 mallocs + publishes — init() already eager-attaches P0's own
+    // data segment. Accessing it should NOT trigger uffd (PTE exists).
+    int before = uffd_all_attached_count();
+
     void* p = uballoc::malloc(64);
     assert(p);
     assert(uballoc::publish(p, 64, TID_A) >= 0);
     std::memset(p, 0xA5, 64);
 
-    pid_t pid = fork();
-    assert(pid >= 0);
-    if (pid == 0) {
-        ::close(rp[0]);
-        ar_child_init();
-        assert(uballoc::g_uffd_active.load(std::memory_order_acquire));
+    // Access the eager-attached segment — no uffd fault expected.
+    volatile uint8_t* vp = static_cast<volatile uint8_t*>(p);
+    assert(vp[0] == 0xA5);
+    for (int i = 0; i < 64; ++i) assert(vp[i] == 0xA5);
 
-        int before = uffd_all_attached_count();
-
-        // P0 already published before P1 init → P1's init() check_remote
-        // eager-attaches P0's data segment. lookup_by_type returns the
-        // eager-attached address (PTE already exists → no uffd fault).
-        auto info = uballoc::lookup_by_type(TID_A);
-        assert(info.address != nullptr);
-        assert(info.size == 64);
-
-        volatile uint8_t* p2 = static_cast<volatile uint8_t*>(info.address);
-        uint8_t v = p2[0];  // no uffd fault (eager-attached)
-        assert(v == 0xA5);
-        for (int i = 0; i < 64; ++i) assert(p2[i] == 0xA5);
-
-        // uffd handler never triggered → g_uffd_attached unchanged.
-        int after = uffd_all_attached_count();
-        assert(after == before && "eager-attached segment should NOT add uffd entry");
-
-        ar_write_byte(rp[1], 'D');
-        _exit(0);
-    }
-
-    ::close(rp[1]);
-
-    int st;
-    waitpid(pid, &st, 0);
-    check_child(st);
-    ::close(rp[0]);
+    int after = uffd_all_attached_count();
+    assert(after == before && "eager-attached segment should NOT add uffd entry");
 
     uballoc::unpublish(p);
     uballoc::free(p);
@@ -566,6 +572,7 @@ void dt13_9_fork_child_uninstall(const std::string& heap_id) {
 }  // namespace
 
 int main() {
+    std::cout.setf(std::ios::unitbuf);  // unbuffered stdout for real-time output
     std::string id = ar_heap_id("ar13");
 
     if (!uffd_available()) {

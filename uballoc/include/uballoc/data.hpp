@@ -100,6 +100,14 @@ struct SlabSlice {
     
     T* data() { return base_ + 1; }
     const T* data() const { return base_ + 1; }
+
+    // Best-effort probe: base_ is a plain pointer written by
+    // register_segment (under reclaim_lock on the discovery path,
+    // but NOT under lock on the grow_segment path). Readers (pop)
+    // do not hold the lock, so this is a best-effort race detection.
+    // False positive (reads stale nullptr) → caller retries/falls back.
+    // False negative (reads stale non-null) → deref may fault (fh recovers).
+    bool is_registered() const { return base_ != nullptr; }
 };
 
 template<typename B>
